@@ -37,6 +37,8 @@ type Options struct {
 	// OnEvent, if set, is called synchronously for each parsed event, in order, on the
 	// goroutine that called Run. It lets the caller cancel the context mid-run.
 	OnEvent func(Event)
+	// OnProcess, if set, is called once with the OS pid right after the process starts.
+	OnProcess func(pid int)
 }
 
 // Result is what one invocation actually produced.
@@ -82,6 +84,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("claudecode: start %q: %w", bin, err)
+	}
+	if o.OnProcess != nil {
+		o.OnProcess(cmd.Process.Pid)
 	}
 
 	var res Result

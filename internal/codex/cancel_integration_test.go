@@ -63,7 +63,7 @@ func TestRealCancelDuringToolExecution(t *testing.T) {
 			mu.Lock()
 			lastTree = strings.Join(tree, ", ")
 			mu.Unlock()
-			if hasProc(tree, "powershell.exe") {
+			if hasProc(tree, "ping.exe") {
 				once.Do(func() {
 					_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
 					killed <- "root pid " + strconv.Itoa(pid) + " tree before kill: " + strings.Join(tree, ", ")
