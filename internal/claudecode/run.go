@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"workstave/internal/procgroup"
 )
 
 // Event is one JSONL line from stdout. Raw keeps the original bytes for evidence.
@@ -68,6 +70,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	cmd := exec.CommandContext(ctx, bin, buildArgs(o)...)
 	cmd.Dir = o.Dir
+	procgroup.Configure(cmd)
+	// Context cancellation kills the whole process tree, not just the direct child.
+	cmd.Cancel = func() error { return procgroup.Kill(cmd.Process.Pid) }
 	cmd.Stdin = strings.NewReader(o.Prompt)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
