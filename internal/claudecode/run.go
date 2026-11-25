@@ -18,6 +18,7 @@ import (
 type Event struct {
 	Type      string          `json:"type"`
 	Subtype   string          `json:"subtype"`
+	IsError   bool            `json:"is_error"`
 	SessionID string          `json:"session_id"`
 	Raw       json.RawMessage `json:"-"`
 }
