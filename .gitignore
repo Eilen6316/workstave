@@ -1,0 +1,16 @@
+﻿# build output
+*.exe
+/bin/
+/dist/
+# local scratch and experiment evidence
+/.scratch/
+# tool state
+/.statamcp/
+# local data
+*.db
+*.db-wal
+*.db-shm
+.env
+*.log
+/design
+/docs
