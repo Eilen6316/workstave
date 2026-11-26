@@ -1,0 +1,42 @@
+package main
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"workstave/internal/lock"
+)
+
+// These tests use a real OS file lock and a real SQLite file in a temp directory. They check
+// the CLI wiring only (lock before store, refusal while held); they run no harness.
+
+func TestRecoverIsRefusedWhileStateDirIsLocked(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ws.db")
+
+	held, err := lock.Acquire(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"recover", "-db", dbPath}); code != 1 {
+		t.Errorf("recover exit code while the lock is held = %d, want 1", code)
+	}
+	if _, err := os.Stat(dbPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the database was created while the lock was held (stat err = %v); the lock must come before the store", err)
+	}
+
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"recover", "-db", dbPath}); code != 0 {
+		t.Errorf("recover exit code after the lock was released = %d, want 0", code)
+	}
+	// The command released its own lock on exit.
+	l, err := lock.Acquire(dir)
+	if err != nil {
+		t.Fatalf("recover left the state directory locked: %v", err)
+	}
+	_ = l.Release()
+}

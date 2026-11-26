@@ -40,16 +40,9 @@ func (d *DB) BindNative(ctx context.Context, sessionID, harness, cwd string) (in
 		return 0, fmt.Errorf("store: bind native: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE native_bindings SET active = 0 WHERE session_id = ? AND active = 1`, sessionID); err != nil {
-		return 0, fmt.Errorf("store: deactivate binding of %q: %w", sessionID, err)
-	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO native_bindings(session_id, harness, cwd, active, created_at) VALUES (?,?,?,1,?)`, sessionID, harness, cwd, nowMS())
+	id, err := bindTx(ctx, tx, sessionID, harness, cwd, "")
 	if err != nil {
-		return 0, fmt.Errorf("store: insert binding for %q: %w", sessionID, err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("store: binding id: %w", err)
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit binding: %w", err)

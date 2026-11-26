@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 
+	"workstave/internal/lock"
 	"workstave/internal/outcome"
 	"workstave/internal/runner"
 	"workstave/internal/store"
@@ -44,11 +45,19 @@ func defaultDB() string {
 	return filepath.Join(dir, "workstave", "workstave.db")
 }
 
-func openDB(ctx context.Context, path string) (*store.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("create db directory: %w", err)
+// openDB takes the state-directory lock, then opens the store. The returned close function
+// closes the store first and releases the lock after, so the lock outlives every write.
+func openDB(ctx context.Context, path string) (*store.DB, func(), error) {
+	l, err := lock.Acquire(filepath.Dir(path))
+	if err != nil {
+		return nil, nil, err
 	}
-	return store.Open(ctx, path)
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		_ = l.Release()
+		return nil, nil, err
+	}
+	return db, func() { _ = db.Close(); _ = l.Release() }, nil
 }
 
 func newID() string {
@@ -100,12 +109,12 @@ func cmdRun(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	db, err := openDB(ctx, *dbPath)
+	db, closeDB, err := openDB(ctx, *dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave run: %v\n", err)
 		return 1
 	}
-	defer db.Close()
+	defer closeDB()
 
 	sessionID, runID := "s-"+newID(), "r-"+newID()
 	if err := db.CreateSession(ctx, sessionID, "default", "worker"); err != nil {
@@ -123,8 +132,9 @@ func cmdRun(args []string) int {
 	return 0
 }
 
-// cmdRecover marks runs without an outcome as unknown. Run it only when no other workstave
-// process is executing, because a run in flight elsewhere would be marked unknown too.
+// cmdRecover marks runs without an outcome as unknown. It takes the state-directory lock, so it
+// refuses to run while another workstave process is executing; otherwise a run in flight
+// elsewhere would be marked unknown too.
 func cmdRecover(args []string) int {
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
 	dbPath := fs.String("db", defaultDB(), "database path")
@@ -132,12 +142,12 @@ func cmdRecover(args []string) int {
 		return 2
 	}
 	ctx := context.Background()
-	db, err := openDB(ctx, *dbPath)
+	db, closeDB, err := openDB(ctx, *dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave recover: %v\n", err)
 		return 1
 	}
-	defer db.Close()
+	defer closeDB()
 	n, err := db.MarkUnfinishedUnknown(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave recover: %v\n", err)

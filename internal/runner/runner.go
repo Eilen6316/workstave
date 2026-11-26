@@ -45,23 +45,15 @@ type Params struct {
 // The outcome is recorded even when ctx was cancelled during execution. Resuming an existing
 // native session is not handled here yet.
 func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Outcome, error) {
-	if existing, ok, err := db.RunForOp(ctx, p.OpID); err != nil {
-		return "", err
-	} else if ok {
-		return "", fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, existing.ID)
-	}
-	bindingID, err := db.BindNative(ctx, p.SessionID, h.Name(), p.Dir)
+	// One transaction records the binding, the pre-assigned native id and the run. Nothing is
+	// launched until it has committed; a repeated op id writes nothing and launches nothing.
+	nativeID := h.NewNativeID()
+	bindingID, run, created, err := db.BeginFirstRun(ctx, p.RunID, p.SessionID, h.Name(), p.Dir, nativeID, p.OpID)
 	if err != nil {
 		return "", err
 	}
-	nativeID := h.NewNativeID()
-	if nativeID != "" {
-		if err := db.SetNativeID(ctx, bindingID, nativeID, ""); err != nil {
-			return "", err
-		}
-	}
-	if _, _, err := db.BeginRun(ctx, p.RunID, p.SessionID, bindingID, p.OpID); err != nil {
-		return "", err
+	if !created {
+		return "", fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
 	}
 
 	var idErr error

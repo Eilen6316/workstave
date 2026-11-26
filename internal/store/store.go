@@ -48,18 +48,44 @@ type DB struct {
 	sql *sql.DB
 }
 
-// Open opens or creates the database at path and applies the schema.
+// schemaVersion is stored in PRAGMA user_version. Open refuses a database whose version is
+// newer than this, so an older binary never writes into a schema it does not understand.
+// Databases created before versioning have user_version 0 and are stamped on first open.
+const schemaVersion = 1
+
+// Open opens or creates the database at path and applies the schema. Every connection runs
+// with synchronous=FULL so a committed record survives a power loss, not only a process crash.
 func Open(ctx context.Context, path string) (*DB, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %q: %w", path, err)
+	}
+	if err := checkVersion(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: stamp schema version: %w", err)
+	}
 	return &DB{sql: db}, nil
+}
+
+// checkVersion refuses a database written by a newer schema before anything is changed.
+func checkVersion(ctx context.Context, db *sql.DB) error {
+	var v int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	if v > schemaVersion {
+		return fmt.Errorf("store: database schema version %d is newer than the supported version %d", v, schemaVersion)
+	}
+	return nil
 }
 
 // Close releases the database handle.
