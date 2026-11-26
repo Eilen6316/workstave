@@ -127,22 +127,6 @@ func (d *DB) UnfinishedRuns(ctx context.Context) ([]Run, error) {
 	return out, nil
 }
 
-// MarkUnfinishedUnknown records outcome unknown for every run without an outcome and returns
-// how many were changed. Call it once at daemon start, before any new run begins: a run that
-// was in flight when the previous daemon stopped has an unobserved end and must be reconciled,
-// never treated as success, failure, or safe to retry.
-func (d *DB) MarkUnfinishedUnknown(ctx context.Context) (int64, error) {
-	res, err := d.sql.ExecContext(ctx, `UPDATE runs SET outcome = 'unknown', ended_at = ? WHERE outcome IS NULL`, nowMS())
-	if err != nil {
-		return 0, fmt.Errorf("store: mark unfinished runs unknown: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("store: mark unfinished runs unknown: %w", err)
-	}
-	return n, nil
-}
-
 func (d *DB) runByOp(ctx context.Context, opID string) (Run, error) {
 	var r Run
 	err := d.sql.QueryRowContext(ctx, `SELECT id, session_id, binding_id, op_id, started_at, ended_at, outcome FROM runs WHERE op_id = ?`, opID).

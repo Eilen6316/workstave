@@ -96,6 +96,20 @@ func TestHarnessAssignedIDIsRecordedWhenReported(t *testing.T) {
 	}
 }
 
+func TestDispatchingIsCommittedBeforeLaunch(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	f := &fake{name: "codex", out: outcome.Completed}
+	f.during = func() {
+		if s, err := db.DispatchState(ctx, "r1"); err != nil || s != store.DispatchDispatching {
+			t.Errorf("dispatch state during launch = %q err=%v, want dispatching", s, err)
+		}
+	}
+	if _, err := Create(ctx, db, f, params); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExecuteErrorIsRecordedAsUnknown(t *testing.T) {
 	db := open(t)
 	boom := errors.New("boom")

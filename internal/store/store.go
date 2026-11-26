@@ -51,7 +51,7 @@ type DB struct {
 // schemaVersion is stored in PRAGMA user_version. Open refuses a database whose version is
 // newer than this, so an older binary never writes into a schema it does not understand.
 // Databases created before versioning have user_version 0 and are stamped on first open.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Open opens or creates the database at path and applies the schema. Every connection runs
 // with synchronous=FULL so a committed record survives a power loss, not only a process crash.
@@ -68,6 +68,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
+	}
+	if err := migrateDispatch(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		_ = db.Close()

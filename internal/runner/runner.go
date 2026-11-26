@@ -55,6 +55,11 @@ func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Out
 	if !created {
 		return "", fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
 	}
+	// Commit dispatching before the external call: a crash after this point must not be read as
+	// "never launched".
+	if err := db.MarkDispatching(ctx, p.RunID); err != nil {
+		return "", err
+	}
 
 	var idErr error
 	out, runErr := h.Execute(ctx, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt}, func(id string) {

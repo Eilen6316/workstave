@@ -148,11 +148,11 @@ func cmdRecover(args []string) int {
 		return 1
 	}
 	defer closeDB()
-	n, err := db.MarkUnfinishedUnknown(ctx)
+	rec, err := db.RecoverOnStart(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave recover: %v\n", err)
 		return 1
 	}
-	fmt.Printf("marked %d unfinished run(s) as unknown\n", n)
+	fmt.Printf("recovered: %d pending run(s) kept, %d run(s) marked unknown\n", rec.Pending, rec.Unknown)
 	return 0
 }
