@@ -40,3 +40,9 @@ func TestRecoverIsRefusedWhileStateDirIsLocked(t *testing.T) {
 	}
 	_ = l.Release()
 }
+
+func TestResumeRequiresSession(t *testing.T) {
+	if code := run([]string{"resume", "-harness", "codex", "-prompt", "continue", "-db", filepath.Join(t.TempDir(), "ws.db")}); code != 2 {
+		t.Fatalf("resume without -session exit code = %d, want 2", code)
+	}
+}

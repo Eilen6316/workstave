@@ -27,7 +27,7 @@ func (Claude) NewNativeID() string {
 
 func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	res, err := claudecode.Run(ctx, claudecode.Options{
-		Dir: req.Dir, SessionID: req.NativeID, Prompt: req.Prompt, MaxBudget: c.MaxBudget,
+		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt, MaxBudget: c.MaxBudget,
 		OnEvent: func(ev claudecode.Event) {
 			if ev.Type == "system" && ev.Subtype == "init" {
 				onAcknowledged(ev.SessionID)
@@ -45,9 +45,14 @@ func (Codex) Name() string { return "codex" }
 func (Codex) NewNativeID() string { return "" }
 
 func (Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+	threadID := ""
+	if req.Resume {
+		threadID = req.NativeID
+	}
 	res, err := codex.Run(ctx, codex.Options{
-		Dir:    req.Dir,
-		Prompt: req.Prompt,
+		Dir:      req.Dir,
+		ThreadID: threadID,
+		Prompt:   req.Prompt,
 		OnEvent: func(ev codex.Event) {
 			if ev.Type == "thread.started" {
 				onAcknowledged(ev.ThreadID)

@@ -15,6 +15,7 @@ import (
 
 type fake struct {
 	name, preID, ackID string
+	lastReq            Request
 	out                outcome.Outcome
 	err                error
 	during             func()
@@ -23,8 +24,9 @@ type fake struct {
 
 func (f *fake) Name() string        { return f.name }
 func (f *fake) NewNativeID() string { return f.preID }
-func (f *fake) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (f *fake) Execute(_ context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	f.calls++
+	f.lastReq = req
 	if f.during != nil {
 		f.during()
 	}
@@ -131,6 +133,85 @@ func TestPausedWorkDoesNotLaunchHarness(t *testing.T) {
 	}
 	if got, err := db.DispatchState(ctx, "r1"); err != nil || got != store.DispatchPending {
 		t.Fatalf("dispatch for paused work = %q err=%v, want pending", got, err)
+	}
+}
+
+func TestResumeUsesSavedBindingAndCreatesANewRun(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	created, err := Create(ctx, db, &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}, params)
+	if err != nil || created != outcome.Completed {
+		t.Fatalf("create got %q err=%v", created, err)
+	}
+	first, ok, err := db.RunForOp(ctx, params.OpID)
+	if err != nil || !ok {
+		t.Fatalf("first run: ok=%v err=%v", ok, err)
+	}
+
+	h := &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}
+	got, err := Resume(ctx, db, h, ResumeParams{SessionID: "s1", RunID: "r2", OpID: "op2", Prompt: "continue"})
+	if err != nil || got != outcome.Completed {
+		t.Fatalf("resume got %q err=%v", got, err)
+	}
+	if h.calls != 1 || !h.lastReq.Resume || h.lastReq.NativeID != "thread-1" || h.lastReq.Dir != params.Dir || h.lastReq.Prompt != "continue" {
+		t.Fatalf("resume request/calls = %+v/%d", h.lastReq, h.calls)
+	}
+	second, ok, err := db.RunForOp(ctx, "op2")
+	if err != nil || !ok || second.ID != "r2" || second.BindingID != first.BindingID {
+		t.Fatalf("resumed run = %+v ok=%v err=%v, want new run on binding %d", second, ok, err, first.BindingID.Int64)
+	}
+	if _, err := Resume(ctx, db, h, ResumeParams{SessionID: "s1", RunID: "r3", OpID: "op2", Prompt: "continue"}); err == nil || h.calls != 1 {
+		t.Fatalf("repeated resume op: err=%v harness calls=%d, want error and no second launch", err, h.calls)
+	}
+}
+
+func TestResumeRejectsBindingWithoutNativeID(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	if _, err := Create(ctx, db, &fake{name: "codex", out: outcome.Completed}, params); err != nil {
+		t.Fatal(err)
+	}
+	h := &fake{name: "codex", out: outcome.Completed}
+	if _, err := Resume(ctx, db, h, ResumeParams{SessionID: "s1", RunID: "r2", OpID: "op2", Prompt: "continue"}); err == nil {
+		t.Fatal("resume without a native id succeeded")
+	}
+	if h.calls != 0 {
+		t.Fatalf("harness launched %d times without a native id", h.calls)
+	}
+}
+
+func TestResumeRejectsMismatchedHarness(t *testing.T) {
+	db := open(t)
+	if _, err := Create(context.Background(), db, &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}, params); err != nil {
+		t.Fatal(err)
+	}
+	h := &fake{name: "claude-code", preID: "other-id", out: outcome.Completed}
+	if _, err := Resume(context.Background(), db, h, ResumeParams{SessionID: "s1", RunID: "r2", OpID: "op2", Prompt: "continue"}); err == nil {
+		t.Fatal("resume with a different harness succeeded")
+	}
+	if h.calls != 0 {
+		t.Fatalf("mismatched harness launched %d times", h.calls)
+	}
+}
+
+func TestResumeDoesNotLaunchWhenWorkIsPaused(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	if _, err := Create(ctx, db, &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}, params); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	h := &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}
+	if _, err := Resume(ctx, db, h, ResumeParams{SessionID: "s1", RunID: "r2", OpID: "op2", Prompt: "continue"}); err == nil {
+		t.Fatal("resume on paused work succeeded")
+	}
+	if h.calls != 0 {
+		t.Fatalf("harness launched %d times for paused work, want 0", h.calls)
+	}
+	if state, err := db.DispatchState(ctx, "r2"); err != nil || state != store.DispatchPending {
+		t.Fatalf("paused resume dispatch = %q err=%v, want pending", state, err)
 	}
 }
 

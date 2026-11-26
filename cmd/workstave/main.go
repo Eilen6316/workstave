@@ -1,6 +1,7 @@
 // Command workstave is the minimal CLI over the store and runner packages.
 //
 //	workstave run -harness codex|claude -prompt TEXT [-dir DIR] [-db PATH] [-op ID] [-budget USD]
+//	workstave resume -session ID -harness codex|claude -prompt TEXT [-db PATH] [-op ID] [-budget USD]
 //	workstave recover [-db PATH]
 package main
 
@@ -23,12 +24,14 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: workstave run|recover [flags]")
+		fmt.Fprintln(os.Stderr, "usage: workstave run|resume|recover [flags]")
 		return 2
 	}
 	switch args[0] {
 	case "run":
 		return cmdRun(args[1:])
+	case "resume":
+		return cmdResume(args[1:])
 	case "recover":
 		return cmdRecover(args[1:])
 	default:
@@ -66,6 +69,17 @@ func newID() string {
 	return fmt.Sprintf("%x", b)
 }
 
+func makeHarness(name, budget string) (runner.Harness, error) {
+	switch name {
+	case "codex":
+		return runner.Codex{}, nil
+	case "claude":
+		return runner.Claude{MaxBudget: budget}, nil
+	default:
+		return nil, fmt.Errorf("-harness must be codex or claude")
+	}
+}
+
 func cmdRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	harness := fs.String("harness", "", "codex or claude")
@@ -77,14 +91,9 @@ func cmdRun(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	var h runner.Harness
-	switch *harness {
-	case "codex":
-		h = runner.Codex{}
-	case "claude":
-		h = runner.Claude{MaxBudget: *budget}
-	default:
-		fmt.Fprintln(os.Stderr, "workstave run: -harness must be codex or claude")
+	h, err := makeHarness(*harness, *budget)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workstave run: %v\n", err)
 		return 2
 	}
 	if *prompt == "" {
@@ -125,6 +134,58 @@ func cmdRun(args []string) int {
 	fmt.Printf("session=%s run=%s op=%s outcome=%s\n", sessionID, runID, opID, out)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave run: %v\n", err)
+	}
+	if out != outcome.Completed {
+		return 1
+	}
+	return 0
+}
+
+func cmdResume(args []string) int {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	sessionID := fs.String("session", "", "logical session id to resume")
+	harness := fs.String("harness", "", "codex or claude; must match the saved binding")
+	prompt := fs.String("prompt", "", "prompt to send to the existing native session")
+	dbPath := fs.String("db", defaultDB(), "database path")
+	op := fs.String("op", "", "operation id; reuse it only to retry this same resume request")
+	budget := fs.String("budget", "0.05", "claude only: USD cap per run")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *sessionID == "" {
+		fmt.Fprintln(os.Stderr, "workstave resume: -session is required")
+		return 2
+	}
+	if *prompt == "" {
+		fmt.Fprintln(os.Stderr, "workstave resume: -prompt is required")
+		return 2
+	}
+	h, err := makeHarness(*harness, *budget)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workstave resume: %v\n", err)
+		return 2
+	}
+	opID := *op
+	if opID == "" {
+		opID = "op-" + newID()
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	db, closeDB, err := openDB(ctx, *dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workstave resume: %v\n", err)
+		return 1
+	}
+	defer closeDB()
+
+	runID := "r-" + newID()
+	out, err := runner.Resume(ctx, db, h, runner.ResumeParams{
+		SessionID: *sessionID, RunID: runID, OpID: opID, Prompt: *prompt,
+	})
+	fmt.Printf("session=%s run=%s op=%s outcome=%s\n", *sessionID, runID, opID, out)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workstave resume: %v\n", err)
 	}
 	if out != outcome.Completed {
 		return 1

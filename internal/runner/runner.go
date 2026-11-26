@@ -1,7 +1,6 @@
-// Package runner starts the first run of a logical session on a harness and keeps the store
-// consistent with what was observed. The order is fixed: the binding, the operation id and the
-// run are persisted before any external process is started; the outcome is recorded from
-// terminal events only; a run that could not be observed to its end is recorded as unknown.
+// Package runner creates or resumes native sessions and keeps the store consistent with what
+// was observed. The binding, operation id and run are persisted before an external process is
+// started; outcomes come from terminal events only, and an unobserved end is recorded unknown.
 package runner
 
 import (
@@ -18,10 +17,11 @@ type Request struct {
 	Dir      string
 	NativeID string // set when the caller pre-assigned it; empty when the harness creates it
 	Prompt   string
+	Resume   bool
 }
 
-// Harness is what Create needs from a harness. Both existing drivers differ on exactly this
-// point: Claude Code accepts an id chosen before launch, Codex reports its id after creation.
+// Harness is the execution surface needed by create and resume. Claude Code accepts an id
+// before launch; Codex reports its id after creation.
 type Harness interface {
 	Name() string
 	// NewNativeID returns an id to pre-assign, or "" if the harness assigns its own.
@@ -40,10 +40,17 @@ type Params struct {
 	Prompt    string
 }
 
+// ResumeParams identifies a new run on an existing native session.
+type ResumeParams struct {
+	SessionID string
+	RunID     string
+	OpID      string
+	Prompt    string
+}
+
 // Create binds the session to the harness, records the run, executes it and records the
 // outcome. If OpID already has a run, nothing is touched or launched and an error is returned.
-// The outcome is recorded even when ctx was cancelled during execution. Resuming an existing
-// native session is not handled here yet.
+// The outcome is recorded even when ctx was cancelled during execution.
 func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Outcome, error) {
 	// One transaction records the binding, the pre-assigned native id and the run. Nothing is
 	// launched until it has committed; a repeated op id writes nothing and launches nothing.
@@ -60,10 +67,42 @@ func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Out
 	if err := db.AuthorizeDispatch(ctx, p.RunID); err != nil {
 		return "", err
 	}
+	return executeAuthorized(ctx, db, h, bindingID, p.RunID, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt})
+}
 
+// Resume starts a new run on the active native binding of the same logical session. It uses
+// the persisted harness, native id and working directory and never creates a new binding.
+func Resume(ctx context.Context, db *store.DB, h Harness, p ResumeParams) (outcome.Outcome, error) {
+	binding, err := db.ActiveBinding(ctx, p.SessionID)
+	if err != nil {
+		return "", err
+	}
+	if binding.Harness != h.Name() {
+		return "", fmt.Errorf("runner: session %q is bound to %q, not %q", p.SessionID, binding.Harness, h.Name())
+	}
+	if binding.NativeID == "" {
+		return "", fmt.Errorf("runner: session %q has no recorded native id; cannot resume", p.SessionID)
+	}
+
+	run, created, err := db.BeginRun(ctx, p.RunID, p.SessionID, binding.ID, p.OpID)
+	if err != nil {
+		return "", err
+	}
+	if !created {
+		return "", fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
+	}
+	if err := db.AuthorizeDispatch(ctx, run.ID); err != nil {
+		return "", err
+	}
+	return executeAuthorized(ctx, db, h, binding.ID, run.ID, Request{
+		Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true,
+	})
+}
+
+func executeAuthorized(ctx context.Context, db *store.DB, h Harness, bindingID int64, runID string, req Request) (outcome.Outcome, error) {
 	var idErr error
 	recordCtx := context.WithoutCancel(ctx)
-	out, runErr := h.Execute(ctx, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt}, func(id string) {
+	out, runErr := h.Execute(ctx, req, func(id string) {
 		if idErr != nil {
 			return
 		}
@@ -71,23 +110,23 @@ func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Out
 			idErr = fmt.Errorf("runner: harness acknowledged an empty native session id")
 			return
 		}
-		if nativeID == "" {
+		if req.NativeID == "" {
 			if err := db.SetNativeID(recordCtx, bindingID, id, ""); err != nil {
 				idErr = err
 				return
 			}
-		} else if id != nativeID {
-			idErr = fmt.Errorf("runner: harness acknowledged native session %q, want %q", id, nativeID)
+		} else if id != req.NativeID {
+			idErr = fmt.Errorf("runner: harness acknowledged native session %q, want %q", id, req.NativeID)
 			return
 		}
-		if err := db.MarkAcknowledged(recordCtx, p.RunID); err != nil {
+		if err := db.MarkAcknowledged(recordCtx, runID); err != nil {
 			idErr = err
 		}
 	})
 	if runErr != nil || out == "" {
 		out = outcome.Unknown
 	}
-	if err := db.FinishRun(context.WithoutCancel(ctx), p.RunID, out); err != nil {
+	if err := db.FinishRun(recordCtx, runID, out); err != nil {
 		return out, errors.Join(runErr, idErr, err)
 	}
 	return out, errors.Join(runErr, idErr)
