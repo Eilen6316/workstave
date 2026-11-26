@@ -123,11 +123,11 @@ func executeAuthorized(ctx context.Context, db *store.DB, h Harness, bindingID i
 			idErr = err
 		}
 	})
-	if runErr != nil || out == "" {
+	if runErr != nil || idErr != nil || out == "" {
 		out = outcome.Unknown
 	}
 	if err := db.FinishRun(recordCtx, runID, out); err != nil {
-		return out, errors.Join(runErr, idErr, err)
+		return outcome.Unknown, errors.Join(runErr, idErr, err)
 	}
 	return out, errors.Join(runErr, idErr)
 }

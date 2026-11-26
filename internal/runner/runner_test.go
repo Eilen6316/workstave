@@ -104,6 +104,32 @@ func TestHarnessAssignedIDIsRecordedWhenReported(t *testing.T) {
 	}
 }
 
+func TestMismatchedNativeIDMakesRunUnknown(t *testing.T) {
+	db := open(t)
+	h := &fake{name: "claude-code", preID: "native-expected", ackID: "native-reported", out: outcome.Completed}
+	got, err := Create(context.Background(), db, h, params)
+	if err == nil || got != outcome.Unknown {
+		t.Fatalf("mismatched native id got %q err=%v, want unknown and an error", got, err)
+	}
+	if storedOutcome(t, db) != string(outcome.Unknown) {
+		t.Fatalf("stored outcome = %q, want unknown", storedOutcome(t, db))
+	}
+}
+
+func TestFinishRunPersistenceFailureDoesNotReturnCompleted(t *testing.T) {
+	db := open(t)
+	h := &fake{name: "codex", out: outcome.Completed}
+	h.during = func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close store during harness execution: %v", err)
+		}
+	}
+	got, err := Create(context.Background(), db, h, params)
+	if err == nil || got != outcome.Unknown {
+		t.Fatalf("persistence failure got %q err=%v, want unknown and an error", got, err)
+	}
+}
+
 func TestDispatchingIsCommittedBeforeLaunch(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()

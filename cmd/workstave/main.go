@@ -69,6 +69,13 @@ func newID() string {
 	return fmt.Sprintf("%x", b)
 }
 
+func runExitCode(out outcome.Outcome, err error) int {
+	if err != nil || out != outcome.Completed {
+		return 1
+	}
+	return 0
+}
+
 func makeHarness(name, budget string) (runner.Harness, error) {
 	switch name {
 	case "codex":
@@ -135,10 +142,7 @@ func cmdRun(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave run: %v\n", err)
 	}
-	if out != outcome.Completed {
-		return 1
-	}
-	return 0
+	return runExitCode(out, err)
 }
 
 func cmdResume(args []string) int {
@@ -187,10 +191,7 @@ func cmdResume(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave resume: %v\n", err)
 	}
-	if out != outcome.Completed {
-		return 1
-	}
-	return 0
+	return runExitCode(out, err)
 }
 
 // cmdRecover marks runs without an outcome as unknown. It takes the state-directory lock, so it

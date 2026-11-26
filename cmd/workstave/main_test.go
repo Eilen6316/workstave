@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"workstave/internal/lock"
+	"workstave/internal/outcome"
 )
 
 // These tests use a real OS file lock and a real SQLite file in a temp directory. They check
@@ -44,5 +45,27 @@ func TestRecoverIsRefusedWhileStateDirIsLocked(t *testing.T) {
 func TestResumeRequiresSession(t *testing.T) {
 	if code := run([]string{"resume", "-harness", "codex", "-prompt", "continue", "-db", filepath.Join(t.TempDir(), "ws.db")}); code != 2 {
 		t.Fatalf("resume without -session exit code = %d, want 2", code)
+	}
+}
+
+func TestRunExitCodeRequiresPersistedSuccess(t *testing.T) {
+	persistErr := errors.New("finish run: database is closed")
+	cases := []struct {
+		name string
+		out  outcome.Outcome
+		err  error
+		want int
+	}{
+		{"completed", outcome.Completed, nil, 0},
+		{"completed with persistence error", outcome.Completed, persistErr, 1},
+		{"unknown", outcome.Unknown, nil, 1},
+		{"failed", outcome.Failed, nil, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := runExitCode(c.out, c.err); got != c.want {
+				t.Fatalf("runExitCode(%s, %v) = %d, want %d", c.out, c.err, got, c.want)
+			}
+		})
 	}
 }
