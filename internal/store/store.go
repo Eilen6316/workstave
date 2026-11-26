@@ -1,4 +1,5 @@
-// Package store persists the minimal P0-A records: logical sessions, native bindings and runs.
+// Package store persists the minimal P0-A records: logical sessions, per-work dispatch pause,
+// native bindings and runs.
 // It holds data only; it makes no scheduling or recovery decisions.
 package store
 
@@ -20,6 +21,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 	work_id    TEXT NOT NULL,
 	role       TEXT NOT NULL CHECK (role IN ('main','worker')),
 	created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS work_pause (
+	work_id TEXT PRIMARY KEY,
+	paused  INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS native_bindings (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +56,7 @@ type DB struct {
 // schemaVersion is stored in PRAGMA user_version. Open refuses a database whose version is
 // newer than this, so an older binary never writes into a schema it does not understand.
 // Databases created before versioning have user_version 0 and are stamped on first open.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Open opens or creates the database at path and applies the schema. Every connection runs
 // with synchronous=FULL so a committed record survives a power loss, not only a process crash.
@@ -70,6 +75,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
 	if err := migrateDispatch(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := migrateWorkPause(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

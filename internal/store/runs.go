@@ -24,9 +24,19 @@ func nowMS() int64 { return time.Now().UnixMilli() }
 
 // CreateSession records a logical session.
 func (d *DB) CreateSession(ctx context.Context, id, workID, role string) error {
-	_, err := d.sql.ExecContext(ctx, `INSERT INTO sessions(id, work_id, role, created_at) VALUES (?,?,?,?)`, id, workID, role, nowMS())
+	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("store: begin session %q: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO work_pause(work_id) VALUES (?)`, workID); err != nil {
+		return fmt.Errorf("store: initialize pause state for work %q: %w", workID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions(id, work_id, role, created_at) VALUES (?,?,?,?)`, id, workID, role, nowMS()); err != nil {
 		return fmt.Errorf("store: create session %q: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit session %q: %w", id, err)
 	}
 	return nil
 }

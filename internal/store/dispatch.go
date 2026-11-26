@@ -43,32 +43,97 @@ func migrateDispatch(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func (d *DB) setDispatch(ctx context.Context, runID, from, to string) error {
-	res, err := d.sql.ExecContext(ctx, `UPDATE runs SET dispatch = ? WHERE id = ? AND dispatch = ? AND outcome IS NULL`, to, runID, from)
-	if err != nil {
-		return fmt.Errorf("store: run %q %s -> %s: %w", runID, from, to, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: run %q %s -> %s: %w", runID, from, to, err)
-	}
-	if n == 0 {
-		return fmt.Errorf("store: run %q is not an unfinished %s run", runID, from)
+// migrateWorkPause creates the default, unpaused state for work records that predate
+// persisted pause state. The INSERT is idempotent and preserves any existing pause.
+func migrateWorkPause(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO work_pause(work_id, paused) SELECT DISTINCT work_id, 0 FROM sessions`); err != nil {
+		return fmt.Errorf("store: initialize work pause state: %w", err)
 	}
 	return nil
 }
 
-// MarkDispatching records that the external call is about to be attempted. Commit it before
-// the call: if the process dies afterwards, the missing return value must not be read as
-// "not executed".
-func (d *DB) MarkDispatching(ctx context.Context, runID string) error {
-	return d.setDispatch(ctx, runID, DispatchPending, DispatchDispatching)
+// SetWorkPaused changes the dispatch authorization state for a work. Pause and dispatch
+// authorization both write SQLite state, so their commits have a single, observable order.
+func (d *DB) SetWorkPaused(ctx context.Context, workID string, paused bool) error {
+	value := 0
+	if paused {
+		value = 1
+	}
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin pause update for work %q: %w", workID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE work_pause SET paused = ? WHERE work_id = ?`, value, workID)
+	if err != nil {
+		return fmt.Errorf("store: set paused state for work %q: %w", workID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set paused state for work %q: %w", workID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: work %q has no persisted pause state", workID)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit paused state for work %q: %w", workID, err)
+	}
+	return nil
+}
+
+// AuthorizeDispatch atomically checks the work's pause state and moves a pending Run to
+// dispatching. Its committed update is the authorization point; callers may invoke a harness
+// only after this method returns successfully.
+func (d *DB) AuthorizeDispatch(ctx context.Context, runID string) error {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin dispatch authorization for run %q: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE runs
+		SET dispatch = ?
+		WHERE id = ? AND dispatch = ? AND outcome IS NULL
+		AND EXISTS (
+			SELECT 1 FROM sessions s
+			JOIN work_pause p ON p.work_id = s.work_id
+			WHERE s.id = runs.session_id AND p.paused = 0
+		)`, DispatchDispatching, runID, DispatchPending)
+	if err != nil {
+		return fmt.Errorf("store: authorize dispatch for run %q: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: authorize dispatch for run %q: %w", runID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: run %q is not pending, is finished, or its work is paused", runID)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit dispatch authorization for run %q: %w", runID, err)
+	}
+	return nil
 }
 
 // MarkAcknowledged records that a correlatable acknowledgement was observed. It does not say
 // the run is running, finished or cancelled.
 func (d *DB) MarkAcknowledged(ctx context.Context, runID string) error {
-	return d.setDispatch(ctx, runID, DispatchDispatching, DispatchAcknowledged)
+	res, err := d.sql.ExecContext(ctx, `UPDATE runs SET dispatch = ?
+		WHERE id = ? AND dispatch = ? AND outcome IS NULL
+		AND EXISTS (
+			SELECT 1 FROM native_bindings b
+			WHERE b.id = runs.binding_id AND b.native_id IS NOT NULL
+		)`, DispatchAcknowledged, runID, DispatchDispatching)
+	if err != nil {
+		return fmt.Errorf("store: acknowledge dispatch for run %q: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: acknowledge dispatch for run %q: %w", runID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: run %q is not dispatching with a correlated native id", runID)
+	}
+	return nil
 }
 
 // DispatchState returns the dispatch state of a run.

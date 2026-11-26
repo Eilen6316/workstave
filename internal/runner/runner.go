@@ -26,9 +26,9 @@ type Harness interface {
 	Name() string
 	// NewNativeID returns an id to pre-assign, or "" if the harness assigns its own.
 	NewNativeID() string
-	// Execute runs the prompt and reports the observed outcome. onNativeID must be called as
-	// soon as a harness-assigned id is seen.
-	Execute(ctx context.Context, req Request, onNativeID func(id string)) (outcome.Outcome, error)
+	// Execute runs the prompt and reports the observed outcome. onAcknowledged must be called
+	// when the harness reports a correlatable session acknowledgement and its native id.
+	Execute(ctx context.Context, req Request, onAcknowledged func(id string)) (outcome.Outcome, error)
 }
 
 // Params identifies one first run. OpID is the stable operation identity of this request.
@@ -55,15 +55,32 @@ func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Out
 	if !created {
 		return "", fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
 	}
-	// Commit dispatching before the external call: a crash after this point must not be read as
-	// "never launched".
-	if err := db.MarkDispatching(ctx, p.RunID); err != nil {
+	// Pause and dispatch authorization share a SQLite commit order. No external call is allowed
+	// unless this transaction commits with the work unpaused.
+	if err := db.AuthorizeDispatch(ctx, p.RunID); err != nil {
 		return "", err
 	}
 
 	var idErr error
+	recordCtx := context.WithoutCancel(ctx)
 	out, runErr := h.Execute(ctx, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt}, func(id string) {
-		if err := db.SetNativeID(ctx, bindingID, id, ""); err != nil && idErr == nil {
+		if idErr != nil {
+			return
+		}
+		if id == "" {
+			idErr = fmt.Errorf("runner: harness acknowledged an empty native session id")
+			return
+		}
+		if nativeID == "" {
+			if err := db.SetNativeID(recordCtx, bindingID, id, ""); err != nil {
+				idErr = err
+				return
+			}
+		} else if id != nativeID {
+			idErr = fmt.Errorf("runner: harness acknowledged native session %q, want %q", id, nativeID)
+			return
+		}
+		if err := db.MarkAcknowledged(recordCtx, p.RunID); err != nil {
 			idErr = err
 		}
 	})

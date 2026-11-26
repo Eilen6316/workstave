@@ -14,22 +14,22 @@ import (
 // Create. They are not evidence about the real Claude Code or Codex behaviour.
 
 type fake struct {
-	name, preID, reportID string
-	out                   outcome.Outcome
-	err                   error
-	during                func()
-	calls                 int
+	name, preID, ackID string
+	out                outcome.Outcome
+	err                error
+	during             func()
+	calls              int
 }
 
 func (f *fake) Name() string        { return f.name }
 func (f *fake) NewNativeID() string { return f.preID }
-func (f *fake) Execute(_ context.Context, _ Request, onNativeID func(string)) (outcome.Outcome, error) {
+func (f *fake) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	f.calls++
 	if f.during != nil {
 		f.during()
 	}
-	if f.reportID != "" {
-		onNativeID(f.reportID)
+	if f.ackID != "" {
+		onAcknowledged(f.ackID)
 	}
 	return f.out, f.err
 }
@@ -61,7 +61,7 @@ func storedOutcome(t *testing.T, db *store.DB) string {
 func TestRunAndPreassignedIDAreRecordedBeforeLaunch(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
-	f := &fake{name: "claude-code", preID: "native-pre", out: outcome.Completed}
+	f := &fake{name: "claude-code", preID: "native-pre", ackID: "native-pre", out: outcome.Completed}
 	f.during = func() {
 		if open, err := db.UnfinishedRuns(ctx); err != nil || len(open) != 1 {
 			t.Errorf("run not persisted before launch: runs=%d err=%v", len(open), err)
@@ -77,12 +77,15 @@ func TestRunAndPreassignedIDAreRecordedBeforeLaunch(t *testing.T) {
 	if s := storedOutcome(t, db); s != string(outcome.Completed) {
 		t.Fatalf("stored outcome %q", s)
 	}
+	if s, err := db.DispatchState(ctx, "r1"); err != nil || s != store.DispatchAcknowledged {
+		t.Fatalf("dispatch after correlated acknowledgement = %q err=%v, want acknowledged", s, err)
+	}
 }
 
 func TestHarnessAssignedIDIsRecordedWhenReported(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
-	f := &fake{name: "codex", reportID: "thread-1", out: outcome.Completed}
+	f := &fake{name: "codex", ackID: "thread-1", out: outcome.Completed}
 	f.during = func() {
 		if id, err := db.NativeID(ctx, 1); err != nil || id != "" {
 			t.Errorf("native id should be unknown before the harness reports it: id=%q err=%v", id, err)
@@ -93,6 +96,9 @@ func TestHarnessAssignedIDIsRecordedWhenReported(t *testing.T) {
 	}
 	if id, err := db.NativeID(ctx, 1); err != nil || id != "thread-1" {
 		t.Fatalf("native id %q err=%v, want thread-1", id, err)
+	}
+	if s, err := db.DispatchState(ctx, "r1"); err != nil || s != store.DispatchAcknowledged {
+		t.Fatalf("dispatch after correlated acknowledgement = %q err=%v, want acknowledged", s, err)
 	}
 }
 
@@ -107,6 +113,45 @@ func TestDispatchingIsCommittedBeforeLaunch(t *testing.T) {
 	}
 	if _, err := Create(ctx, db, f, params); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPausedWorkDoesNotLaunchHarness(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	f := &fake{name: "codex", ackID: "thread-should-not-start", out: outcome.Completed}
+	if _, err := Create(ctx, db, f, params); err == nil {
+		t.Fatal("Create succeeded for paused work")
+	}
+	if f.calls != 0 {
+		t.Fatalf("harness launched %d times for paused work, want 0", f.calls)
+	}
+	if got, err := db.DispatchState(ctx, "r1"); err != nil || got != store.DispatchPending {
+		t.Fatalf("dispatch for paused work = %q err=%v, want pending", got, err)
+	}
+}
+
+func TestPauseAfterAuthorizationLeavesRunInFlight(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	f := &fake{name: "codex", ackID: "thread-in-flight", out: outcome.Completed}
+	f.during = func() {
+		if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+			t.Errorf("pause while authorized run is entering harness: %v", err)
+		}
+	}
+	got, err := Create(ctx, db, f, params)
+	if err != nil || got != outcome.Completed {
+		t.Fatalf("authorized run after pause got %q err=%v, want completed", got, err)
+	}
+	if f.calls != 1 {
+		t.Fatalf("authorized run launched %d times, want 1", f.calls)
+	}
+	if state, err := db.DispatchState(ctx, "r1"); err != nil || state != store.DispatchAcknowledged {
+		t.Fatalf("dispatch after in-flight run = %q err=%v, want acknowledged", state, err)
 	}
 }
 

@@ -30,11 +30,13 @@ func outcomeOf(t *testing.T, db *DB, runID string) string {
 	return s.String
 }
 
-func seedRun(t *testing.T, db *DB, runID string) {
+func seedRun(t *testing.T, db *DB, runID string) int64 {
 	t.Helper()
-	if _, _, _, err := db.BeginFirstRun(context.Background(), runID, "s1", "codex", "/x", "", "op-"+runID); err != nil {
+	bindingID, _, _, err := db.BeginFirstRun(context.Background(), runID, "s1", "codex", "/x", "", "op-"+runID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return bindingID
 }
 
 func openWithSession(t *testing.T) *DB {
@@ -49,18 +51,24 @@ func openWithSession(t *testing.T) *DB {
 func TestDispatchStateTransitions(t *testing.T) {
 	db := openWithSession(t)
 	ctx := context.Background()
-	seedRun(t, db, "r1")
+	bindingID := seedRun(t, db, "r1")
 	if got := dispatchOf(t, db, "r1"); got != DispatchPending {
 		t.Fatalf("new run dispatch = %q, want pending", got)
 	}
 	if err := db.MarkAcknowledged(ctx, "r1"); err == nil {
 		t.Fatal("pending -> acknowledged was accepted without dispatching")
 	}
-	if err := db.MarkDispatching(ctx, "r1"); err != nil {
+	if err := db.AuthorizeDispatch(ctx, "r1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkDispatching(ctx, "r1"); err == nil {
-		t.Fatal("dispatching -> dispatching was accepted")
+	if err := db.AuthorizeDispatch(ctx, "r1"); err == nil {
+		t.Fatal("dispatching -> dispatching authorization was accepted")
+	}
+	if err := db.MarkAcknowledged(ctx, "r1"); err == nil {
+		t.Fatal("dispatch without a correlated native id was acknowledged")
+	}
+	if err := db.SetNativeID(ctx, bindingID, "native-r1", ""); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.MarkAcknowledged(ctx, "r1"); err != nil {
 		t.Fatal(err)
@@ -68,23 +76,85 @@ func TestDispatchStateTransitions(t *testing.T) {
 	if err := db.FinishRun(ctx, "r1", outcome.Completed); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkDispatching(ctx, "r1"); err == nil {
+	if err := db.AuthorizeDispatch(ctx, "r1"); err == nil {
 		t.Fatal("a finished run was moved back to dispatching")
+	}
+}
+
+func TestPauseCommittedBeforeDispatchRejectsAuthorization(t *testing.T) {
+	db := openWithSession(t)
+	ctx := context.Background()
+	seedRun(t, db, "r-pause-first")
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuthorizeDispatch(ctx, "r-pause-first"); err == nil {
+		t.Fatal("dispatch was authorized after pause committed")
+	}
+	if got := dispatchOf(t, db, "r-pause-first"); got != DispatchPending {
+		t.Fatalf("dispatch after rejected authorization = %q, want pending", got)
+	}
+}
+
+func TestDispatchAuthorizationCommittedBeforePauseRemainsInFlight(t *testing.T) {
+	db := openWithSession(t)
+	ctx := context.Background()
+	seedRun(t, db, "r-dispatch-first")
+	if err := db.AuthorizeDispatch(ctx, "r-dispatch-first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatchOf(t, db, "r-dispatch-first"); got != DispatchDispatching {
+		t.Fatalf("dispatch after pause committed = %q, want dispatching (in flight)", got)
+	}
+}
+
+func TestWorkPauseSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "ws.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSession(ctx, "s1", "w1", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var paused int
+	if err := db.sql.QueryRowContext(ctx, `SELECT paused FROM work_pause WHERE work_id = 'w1'`).Scan(&paused); err != nil || paused != 1 {
+		t.Fatalf("pause state after reopen = %d err=%v, want paused", paused, err)
 	}
 }
 
 func TestRecoverOnStartKeepsPendingAndMarksTheRest(t *testing.T) {
 	db := openWithSession(t)
 	ctx := context.Background()
+	bindings := make(map[string]int64)
 	for _, id := range []string{"r-pending", "r-disp", "r-ack", "r-done"} {
-		seedRun(t, db, id)
+		bindings[id] = seedRun(t, db, id)
 	}
 	for _, id := range []string{"r-disp", "r-ack", "r-done"} {
-		if err := db.MarkDispatching(ctx, id); err != nil {
+		if err := db.AuthorizeDispatch(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, id := range []string{"r-ack", "r-done"} {
+		if err := db.SetNativeID(ctx, bindings[id], "native-"+id, ""); err != nil {
+			t.Fatal(err)
+		}
 		if err := db.MarkAcknowledged(ctx, id); err != nil {
 			t.Fatal(err)
 		}
@@ -160,5 +230,9 @@ func TestOpenMigratesDatabaseWithoutDispatchColumn(t *testing.T) {
 	}
 	if got := outcomeOf(t, db, "r-done"); got != "completed" {
 		t.Errorf("finished run outcome = %q, want completed", got)
+	}
+	var paused int
+	if err := db.sql.QueryRowContext(ctx, `SELECT paused FROM work_pause WHERE work_id = 'w1'`).Scan(&paused); err != nil || paused != 0 {
+		t.Errorf("migrated work pause state = %d err=%v, want unpaused", paused, err)
 	}
 }

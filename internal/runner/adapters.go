@@ -25,8 +25,15 @@ func (Claude) NewNativeID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func (c Claude) Execute(ctx context.Context, req Request, _ func(string)) (outcome.Outcome, error) {
-	res, err := claudecode.Run(ctx, claudecode.Options{Dir: req.Dir, SessionID: req.NativeID, Prompt: req.Prompt, MaxBudget: c.MaxBudget})
+func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+	res, err := claudecode.Run(ctx, claudecode.Options{
+		Dir: req.Dir, SessionID: req.NativeID, Prompt: req.Prompt, MaxBudget: c.MaxBudget,
+		OnEvent: func(ev claudecode.Event) {
+			if ev.Type == "system" && ev.Subtype == "init" {
+				onAcknowledged(ev.SessionID)
+			}
+		},
+	})
 	return res.Outcome(), err
 }
 
@@ -37,13 +44,13 @@ func (Codex) Name() string { return "codex" }
 
 func (Codex) NewNativeID() string { return "" }
 
-func (Codex) Execute(ctx context.Context, req Request, onNativeID func(string)) (outcome.Outcome, error) {
+func (Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	res, err := codex.Run(ctx, codex.Options{
 		Dir:    req.Dir,
 		Prompt: req.Prompt,
 		OnEvent: func(ev codex.Event) {
-			if ev.Type == "thread.started" && ev.ThreadID != "" {
-				onNativeID(ev.ThreadID)
+			if ev.Type == "thread.started" {
+				onAcknowledged(ev.ThreadID)
 			}
 		},
 	})
