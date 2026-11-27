@@ -40,7 +40,8 @@ func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(st
 
 // Codex adapts the Codex exec driver. Codex reports its thread id only after creation.
 type Codex struct {
-	Model string
+	Model           string
+	ConfigOverrides []string // passed via -c to override config.toml settings
 }
 
 func (Codex) Name() string { return "codex" }
@@ -53,10 +54,11 @@ func (c Codex) Execute(ctx context.Context, req Request, onAcknowledged func(str
 		threadID = req.NativeID
 	}
 	res, err := codex.Run(ctx, codex.Options{
-		Dir:      req.Dir,
-		ThreadID: threadID,
-		Model:    c.Model,
-		Prompt:   req.Prompt,
+		Dir:             req.Dir,
+		ThreadID:        threadID,
+		Model:           c.Model,
+		ConfigOverrides: c.ConfigOverrides,
+		Prompt:          req.Prompt,
 		OnEvent: func(ev codex.Event) {
 			if ev.Type == "thread.started" {
 				onAcknowledged(ev.ThreadID)

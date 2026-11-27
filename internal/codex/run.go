@@ -33,6 +33,9 @@ type Options struct {
 	Model    string // optional model override for this invocation
 	Prompt   string // sent on stdin
 	Sandbox  string // defaults to read-only
+	// ConfigOverrides are passed via -c key=value to override config.toml settings.
+	// Use to disable features or restrict permissions, e.g. "features.web_search=false".
+	ConfigOverrides []string
 	// OnEvent, if set, is called synchronously for each parsed event, in order.
 	OnEvent func(Event)
 	// OnProcess, if set, is called once with the OS pid right after the process starts,
@@ -64,14 +67,21 @@ func buildArgs(o Options) []string {
 	}
 	// `codex exec resume` accepts neither -s nor -C (verified against the real CLI), so a
 	// resumed turn cannot be given a new sandbox or root; the process directory carries cwd.
+	// Config overrides are allowed on resume.
 	if o.ThreadID != "" {
 		a := []string{"exec", "resume", o.ThreadID, "--json", "--skip-git-repo-check"}
+		for _, override := range o.ConfigOverrides {
+			a = append(a, "-c", override)
+		}
 		if o.Model != "" {
 			a = append(a, "--model", o.Model)
 		}
 		return append(a, o.Prompt)
 	}
 	a := []string{"exec", "--json", "--skip-git-repo-check"}
+	for _, override := range o.ConfigOverrides {
+		a = append(a, "-c", override)
+	}
 	if o.Model != "" {
 		a = append(a, "--model", o.Model)
 	}

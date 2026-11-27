@@ -94,7 +94,8 @@ func TestRealSafePointCrossHarnessHandoff(t *testing.T) {
 	// This explicit receipt record uses persisted identities and the observed terminal outcome.
 	// The store does not yet contain a Work goal or constraints from which to build a fuller handoff.
 	handoff := fmt.Sprintf("Safe-point receipt. Work %s. Logical Session %s. Previous Run %s completed. Reply exactly HANDOFF_ACCEPTED.", workID, sessionID, firstRun.ID)
-	secondOutcome, err := Create(ctx, db, Codex{}, Params{
+	// Disable web search and MCP to prevent external tool calls during handoff verification.
+	secondOutcome, err := Create(ctx, db, Codex{ConfigOverrides: []string{"features.web_search=false", "features.mcp=false"}}, Params{
 		SessionID: sessionID, RunID: "r-handoff-codex", OpID: "op-handoff-codex", Dir: dir,
 		Prompt: handoff,
 	})
