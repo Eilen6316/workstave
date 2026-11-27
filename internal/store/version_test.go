@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -38,5 +40,47 @@ func TestOpenRefusesNewerSchema(t *testing.T) {
 	_ = db.Close()
 	if _, err := Open(context.Background(), p); err == nil {
 		t.Fatal("a database with a newer schema version was opened")
+	}
+}
+
+func TestOpenControlRequiresExistingCurrentSchema(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	if _, err := OpenControl(ctx, missing); err == nil {
+		t.Fatal("control connection opened a missing database")
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("control connection changed missing database state: stat err=%v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "current.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := OpenControl(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := Open(ctx, legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec(t, legacy, `PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenControl(ctx, legacyPath); err == nil {
+		t.Fatal("control connection accepted a database requiring migration")
 	}
 }

@@ -2,12 +2,15 @@
 //
 //	workstave run -harness codex|claude -prompt TEXT [-dir DIR] [-db PATH] [-op ID] [-budget USD]
 //	workstave resume -session ID -harness codex|claude -prompt TEXT [-db PATH] [-op ID] [-budget USD]
+//	workstave pause -work ID [-db PATH]
+//	workstave unpause -work ID [-db PATH]
 //	workstave recover [-db PATH]
 package main
 
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -24,7 +27,7 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: workstave run|resume|recover [flags]")
+		fmt.Fprintln(os.Stderr, "usage: workstave run|resume|pause|unpause|recover [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -32,6 +35,10 @@ func run(args []string) int {
 		return cmdRun(args[1:])
 	case "resume":
 		return cmdResume(args[1:])
+	case "pause":
+		return cmdSetPaused(args[1:], true)
+	case "unpause":
+		return cmdSetPaused(args[1:], false)
 	case "recover":
 		return cmdRecover(args[1:])
 	default:
@@ -61,6 +68,24 @@ func openDB(ctx context.Context, path string) (*store.DB, func(), error) {
 		return nil, nil, err
 	}
 	return db, func() { _ = db.Close(); _ = l.Release() }, nil
+}
+
+// openControlDB uses the runtime lock when no owner is active. If a runtime owns the state
+// directory, it opens only the existing current-schema database; the control command performs
+// no migrations and writes only the short pause-state transaction.
+func openControlDB(ctx context.Context, path string) (*store.DB, func(), error) {
+	db, closeDB, err := openDB(ctx, path)
+	if err == nil {
+		return db, closeDB, nil
+	}
+	if !errors.Is(err, lock.ErrHeld) {
+		return nil, nil, err
+	}
+	db, err = store.OpenControl(ctx, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db, func() { _ = db.Close() }, nil
 }
 
 func newID() string {
@@ -192,6 +217,39 @@ func cmdResume(args []string) int {
 		fmt.Fprintf(os.Stderr, "workstave resume: %v\n", err)
 	}
 	return runExitCode(out, err)
+}
+
+func cmdSetPaused(args []string, paused bool) int {
+	name := "pause"
+	if !paused {
+		name = "unpause"
+	}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	workID := fs.String("work", "", "work whose future dispatches should be paused or resumed")
+	dbPath := fs.String("db", defaultDB(), "database path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *workID == "" {
+		fmt.Fprintf(os.Stderr, "workstave %s: -work is required\n", name)
+		return 2
+	}
+	db, closeDB, err := openControlDB(context.Background(), *dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workstave %s: %v\n", name, err)
+		return 1
+	}
+	defer closeDB()
+	if err := db.SetWorkPaused(context.Background(), *workID, paused); err != nil {
+		fmt.Fprintf(os.Stderr, "workstave %s: %v\n", name, err)
+		return 1
+	}
+	state := "paused"
+	if !paused {
+		state = "unpaused"
+	}
+	fmt.Printf("work=%s dispatch=%s\n", *workID, state)
+	return 0
 }
 
 // cmdRecover marks runs without an outcome as unknown. It takes the state-directory lock, so it

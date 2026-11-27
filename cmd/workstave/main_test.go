@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"workstave/internal/lock"
 	"workstave/internal/outcome"
+	"workstave/internal/store"
 )
 
 // These tests use a real OS file lock and a real SQLite file in a temp directory. They check
@@ -45,6 +51,144 @@ func TestRecoverIsRefusedWhileStateDirIsLocked(t *testing.T) {
 func TestResumeRequiresSession(t *testing.T) {
 	if code := run([]string{"resume", "-harness", "codex", "-prompt", "continue", "-db", filepath.Join(t.TempDir(), "ws.db")}); code != 2 {
 		t.Fatalf("resume without -session exit code = %d, want 2", code)
+	}
+}
+
+func TestHelperHoldRuntimeForPause(t *testing.T) {
+	path := os.Getenv("WORKSTAVE_PAUSE_OWNER_DB")
+	if path == "" {
+		t.Skip("helper process for TestPauseAndUnpauseWhileRuntimeOwnsStateDirectory")
+	}
+	ctx := context.Background()
+	db, closeDB, err := openDB(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSession(ctx, "s1", "w1", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	bindingID, _, _, err := db.BeginFirstRun(ctx, "r1", "s1", "codex", t.TempDir(), "", "op1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuthorizeDispatch(ctx, "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetNativeID(ctx, bindingID, "thread-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkAcknowledged(ctx, "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.BeginRun(ctx, "r2", "s1", bindingID, "op2"); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(os.Stdout, "runtime-ready")
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishRun(ctx, "r1", outcome.Completed); err != nil {
+		t.Fatal(err)
+	}
+	closeDB()
+}
+
+func TestPauseAndUnpauseWhileRuntimeOwnsStateDirectory(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ws.db")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperHoldRuntimeForPause$")
+	cmd.Env = append(os.Environ(), "WORKSTAVE_PAUSE_OWNER_DB="+dbPath)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	ready := make(chan bool, 1)
+	go func() {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		ready <- err == nil && line == "runtime-ready\n"
+	}()
+	select {
+	case ok := <-ready:
+		if !ok {
+			t.Fatal("runtime owner exited without becoming ready")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runtime owner did not become ready")
+	}
+
+	if code := run([]string{"pause", "-work", "w1", "-db", dbPath}); code != 0 {
+		t.Fatalf("pause while runtime owns state directory exit code = %d, want 0", code)
+	}
+	control, err := store.OpenControl(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := control.DispatchState(context.Background(), "r1"); err != nil || got != store.DispatchAcknowledged {
+		t.Fatalf("pause changed the already-authorized run: dispatch=%q err=%v", got, err)
+	}
+	if err := control.AuthorizeDispatch(context.Background(), "r2"); err == nil {
+		t.Fatal("new dispatch was authorized after the control command committed pause")
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"unpause", "-work", "w1", "-db", dbPath}); code != 0 {
+		t.Fatalf("unpause while runtime owns state directory exit code = %d, want 0", code)
+	}
+	control, err = store.OpenControl(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.AuthorizeDispatch(context.Background(), "r2"); err != nil {
+		t.Fatalf("dispatch after unpause: %v", err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.Acquire(dir); !errors.Is(err, lock.ErrHeld) {
+		t.Fatalf("control commands released runtime lock: err=%v, want ErrHeld", err)
+	}
+	control, err = store.OpenControl(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	if got, err := control.DispatchState(context.Background(), "r2"); err != nil || got != store.DispatchDispatching {
+		t.Fatalf("dispatch after unpause = %q err=%v, want dispatching", got, err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintln(stdin, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("runtime owner exited with error: %v", err)
+	}
+	waited = true
+	db, closeDB, err := openDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB()
+	r, ok, err := db.RunForOp(context.Background(), "op1")
+	if err != nil || !ok || r.Outcome.String != string(outcome.Completed) {
+		t.Fatalf("in-flight run after pause: ok=%v outcome=%q err=%v, want completed", ok, r.Outcome.String, err)
 	}
 }
 

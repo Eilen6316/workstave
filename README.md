@@ -18,7 +18,11 @@ Workstave is an early-stage, local-first persistent work runtime written in Go. 
 - **A run without a terminal event is recorded as `unknown`**, never as success or failure. Exit codes are not trusted.
 - Workstave uses **your own harness configuration** (provider, endpoint, keys). It does not override it. Never commit API keys or tokens.
 - Tests that talk to a real harness are **opt-in and billable**: they only run with `WORKSTAVE_REAL_HARNESS=1`.
-- Verification so far: Windows (amd64) is the main platform; Linux (amd64) was tested for local tests in a container; macOS and the other architectures are only cross-compile checked.
+- Verification so far: local tests run on Windows (amd64); GitHub Actions runs build, vet and race tests on Ubuntu, macOS and Windows. Other architectures are cross-compile checked only.
+
+### Pause dispatching
+
+`workstave run` currently creates sessions in the `default` work. Use `workstave pause -work default [-db PATH]` to block new dispatch authorizations, including while a run is executing, and `workstave unpause -work default [-db PATH]` to allow them again. Pausing does not stop runs that were already authorized.
 
 ### Build and test
 
@@ -51,7 +55,11 @@ Workstave 是一个使用 Go 编写、处于早期阶段的本地优先持久化
 - **没有终态事件的运行一律记为 `unknown`**，不会记成成功或失败，也不信任退出码。
 - Workstave 使用**你自己的 Harness 配置**（provider、endpoint、密钥），不会覆盖它。请不要提交 API Key 或令牌。
 - 会连接真实 Harness 的测试**需要主动开启且会产生费用**：只有设置 `WORKSTAVE_REAL_HARNESS=1` 才会运行。
-- 目前的验证情况：Windows（amd64）是主要平台；Linux（amd64）在容器里跑过本地测试；macOS 和其他架构只做了交叉编译检查。
+- 目前的验证情况：本机在 Windows（amd64）运行测试；GitHub Actions 在 Ubuntu、macOS 和 Windows 上运行 build、vet 与 race 测试。其他架构只做了交叉编译检查。
+
+### 暂停派发
+
+目前 `workstave run` 创建的 Session 属于 `default` Work。使用 `workstave pause -work default [-db PATH]` 阻止新的派发授权；即使 Run 正在执行也可以提交暂停。使用 `workstave unpause -work default [-db PATH]` 恢复派发。暂停不会停止此前已获授权的 Run。
 
 ### 构建与测试
 

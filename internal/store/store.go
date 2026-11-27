@@ -89,6 +89,35 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	return &DB{sql: db}, nil
 }
 
+// OpenControl opens an existing, current-schema database for a short control operation while
+// the runtime owner holds the state-directory lock. It performs no schema changes.
+func OpenControl(ctx context.Context, path string) (*DB, error) {
+	dsn := "file:" + path + "?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open control connection %q: %w", path, err)
+	}
+	closeOnError := func(err error) (*DB, error) {
+		_ = db.Close()
+		return nil, err
+	}
+	var v int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v); err != nil {
+		return closeOnError(fmt.Errorf("store: read control schema version: %w", err))
+	}
+	if v != schemaVersion {
+		return closeOnError(fmt.Errorf("store: control connection requires schema version %d, got %d", schemaVersion, v))
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('work_pause') WHERE name = 'paused'`).Scan(&n); err != nil {
+		return closeOnError(fmt.Errorf("store: inspect control pause state: %w", err))
+	}
+	if n != 1 {
+		return closeOnError(fmt.Errorf("store: control pause state is unavailable"))
+	}
+	return &DB{sql: db}, nil
+}
+
 // checkVersion refuses a database written by a newer schema before anything is changed.
 func checkVersion(ctx context.Context, db *sql.DB) error {
 	var v int
