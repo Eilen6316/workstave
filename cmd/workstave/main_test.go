@@ -67,7 +67,7 @@ func TestHelperHoldRuntimeForPause(t *testing.T) {
 	if err := db.CreateSession(ctx, "s1", "w1", "worker"); err != nil {
 		t.Fatal(err)
 	}
-	bindingID, _, _, err := db.BeginFirstRun(ctx, "r1", "s1", "codex", t.TempDir(), "", "op1")
+	bindingID, _, _, err := db.BeginFirstRun(ctx, "r1", "s1", "codex", t.TempDir(), "", "op1", "intent-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,10 @@ func TestHelperHoldRuntimeForPause(t *testing.T) {
 	if err := db.MarkAcknowledged(ctx, "r1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.BeginRun(ctx, "r2", "s1", bindingID, "op2"); err != nil {
+	if err := db.CreateSession(ctx, "s2", "w1", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := db.BeginFirstRun(ctx, "r2", "s2", "codex", t.TempDir(), "", "op2", "intent-2"); err != nil {
 		t.Fatal(err)
 	}
 	fmt.Fprintln(os.Stdout, "runtime-ready")
@@ -212,4 +215,128 @@ func TestRunExitCodeRequiresPersistedSuccess(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHelperHoldStateOwnerForMailboxAcceptance(t *testing.T) {
+	path := os.Getenv("WORKSTAVE_MAILBOX_OWNER_DB")
+	if path == "" {
+		t.Skip("helper process for TestAskAcceptsWhileStateOwnerIsActive")
+	}
+	if code := run([]string{"daemon", "-db", path}); code != 0 {
+		t.Fatalf("daemon exit code=%d", code)
+	}
+}
+
+func TestWorkAndConversationCommandsPersistTheirIdentities(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "workstave.db")
+	if code := run([]string{"work", "create", "-id", "w-cli", "-harness", "claude", "-dir", dir, "-db", dbPath}); code != 0 {
+		t.Fatalf("work create exit code=%d", code)
+	}
+	if code := run([]string{"conversation", "create", "-work", "w-cli", "-id", "c-cli", "-db", dbPath}); code != 0 {
+		t.Fatalf("conversation create exit code=%d", code)
+	}
+	db, err := store.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	work, err := db.Work(context.Background(), "w-cli")
+	if err != nil || work.MainHarness != "claude-code" || work.WorkingDir != dir {
+		t.Fatalf("Work=%+v err=%v", work, err)
+	}
+	conversation, err := db.Conversation(context.Background(), "c-cli")
+	if err != nil || conversation.WorkID != "w-cli" {
+		t.Fatalf("Conversation=%+v err=%v", conversation, err)
+	}
+	if code := run([]string{"history", "-conversation", "c-cli", "-db", dbPath}); code != 0 {
+		t.Fatalf("empty history exit code=%d", code)
+	}
+	if code := run([]string{"state", "-work", "w-cli", "-db", dbPath}); code != 0 {
+		t.Fatalf("empty state exit code=%d", code)
+	}
+}
+
+func TestAskAcceptsWhileStateOwnerIsActiveAndReusesOperationIdentity(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "workstave.db")
+	if code := run([]string{"work", "create", "-id", "w-cli", "-dir", dir, "-db", dbPath}); code != 0 {
+		t.Fatalf("work create exit code=%d", code)
+	}
+	if code := run([]string{"conversation", "create", "-work", "w-cli", "-id", "c-cli", "-db", dbPath}); code != 0 {
+		t.Fatalf("conversation create exit code=%d", code)
+	}
+	if code := run([]string{"pause", "-work", "w-cli", "-db", dbPath}); code != 0 {
+		t.Fatalf("pause exit code=%d", code)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperHoldStateOwnerForMailboxAcceptance$")
+	cmd.Env = append(os.Environ(), "WORKSTAVE_MAILBOX_OWNER_DB="+dbPath)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	ready := make(chan bool, 1)
+	go func() {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		ready <- err == nil && line == "daemon=ready\n"
+	}()
+	select {
+	case ok := <-ready:
+		if !ok {
+			t.Fatal("owner helper exited before taking the lock")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("owner helper did not become ready")
+	}
+	args := []string{"ask", "-conversation", "c-cli", "-message", "request-1", "-prompt", "Please change the export to TSV.", "-db", dbPath}
+	if code := run(args); code != 0 {
+		t.Fatalf("ask while owner active exit code=%d", code)
+	}
+	control, err := store.OpenControl(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := control.MailboxByMessage(context.Background(), "request-1")
+	if err != nil || first.State != "pending" || first.OpID == "" || first.OpID == "main-request-1" {
+		t.Fatalf("accepted queued input=%+v err=%v", first, err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := run(args); code != 0 {
+		t.Fatalf("repeat ask after lost receipt exit code=%d", code)
+	}
+	control, err = store.OpenControl(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := control.MailboxByMessage(context.Background(), "request-1")
+	if err != nil || repeated.OpID != first.OpID || repeated.Sequence != first.Sequence {
+		t.Fatalf("repeated acceptance=%+v err=%v, want original identity", repeated, err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	conflict := []string{"ask", "-conversation", "c-cli", "-message", "request-1", "-prompt", "Use a different requirement.", "-db", dbPath}
+	if code := run(conflict); code != 1 {
+		t.Fatalf("same request identity with different intent exit code=%d, want 1", code)
+	}
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	waited = true
+	lockAfter, err := lock.Acquire(dir)
+	if err != nil {
+		t.Fatalf("daemon left the state directory locked: %v", err)
+	}
+	_ = lockAfter.Release()
 }

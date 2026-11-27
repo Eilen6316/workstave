@@ -90,6 +90,23 @@ func (d *DB) AuthorizeDispatch(ctx context.Context, runID string) error {
 		return fmt.Errorf("store: begin dispatch authorization for run %q: %w", runID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := authorizeDispatchTx(ctx, tx, runID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit dispatch authorization for run %q: %w", runID, err)
+	}
+	return nil
+}
+
+func authorizeDispatchTx(ctx context.Context, tx *sql.Tx, runID string) error {
+	var sessionID string
+	if err := tx.QueryRowContext(ctx, `SELECT session_id FROM runs WHERE id = ?`, runID).Scan(&sessionID); err != nil {
+		return fmt.Errorf("store: run %q for dispatch authorization: %w", runID, err)
+	}
+	if err := ensureNoUnresolvedRunTx(ctx, tx, sessionID, runID); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE runs
 		SET dispatch = ?
 		WHERE id = ? AND dispatch = ? AND outcome IS NULL
@@ -97,6 +114,16 @@ func (d *DB) AuthorizeDispatch(ctx context.Context, runID string) error {
 			SELECT 1 FROM sessions s
 			JOIN work_pause p ON p.work_id = s.work_id
 			WHERE s.id = runs.session_id AND p.paused = 0
+			AND (s.role = 'worker' OR EXISTS (
+				SELECT 1 FROM main_runs mr JOIN works w ON w.id = mr.work_id
+				JOIN mailbox m ON m.sequence = mr.mailbox_sequence
+				WHERE mr.run_id = runs.id AND w.main_session_id = runs.session_id
+				AND mr.controller_epoch = w.controller_epoch AND m.state = 'processing'
+			))
+		)
+		AND EXISTS (
+			SELECT 1 FROM native_bindings b WHERE b.id = runs.binding_id
+			AND b.session_id = runs.session_id AND b.active = 1
 		)`, DispatchDispatching, runID, DispatchPending)
 	if err != nil {
 		return fmt.Errorf("store: authorize dispatch for run %q: %w", runID, err)
@@ -106,10 +133,7 @@ func (d *DB) AuthorizeDispatch(ctx context.Context, runID string) error {
 		return fmt.Errorf("store: authorize dispatch for run %q: %w", runID, err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: run %q is not pending, is finished, or its work is paused", runID)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit dispatch authorization for run %q: %w", runID, err)
+		return fmt.Errorf("store: run %q is not an authorized pending run, its session has another unresolved Run, or its Work is paused", runID)
 	}
 	return nil
 }

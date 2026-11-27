@@ -3,7 +3,10 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -54,17 +57,19 @@ type ResumeParams struct {
 
 // MainParams associates a queued Conversation input with the Work's logical Main Run.
 type MainParams struct {
-	WorkID          string
-	ConversationID  string
-	MailboxSequence int64
-	MessageID       string
-	ReplyID         string
-	RunID           string
-	OpID            string
-	WorkingDir      string
-	InputSnapshot   string
-	ContextRevision int64
-	Prompt          string
+	WorkID                 string
+	ConversationID         string
+	MailboxSequence        int64
+	MessageID              string
+	ReplyID                string
+	RunID                  string
+	OpID                   string
+	WorkingDir             string
+	InputSnapshot          string
+	ContextRevision        int64
+	Prompt                 string
+	DecodeReply            func(string) (store.MainCompletion, error)
+	CrossHarnessExperiment bool
 }
 
 // Create binds a session to a Harness, records a Run, executes it and returns its outcome.
@@ -76,17 +81,32 @@ func Create(ctx context.Context, db *store.DB, h Harness, p Params) (outcome.Out
 // CreateWithOutput is Create with the final assistant text observed on the Harness stream.
 func CreateWithOutput(ctx context.Context, db *store.DB, h Harness, p Params) (Execution, error) {
 	nativeID := h.NewNativeID()
-	bindingID, run, created, err := db.BeginFirstRun(ctx, p.RunID, p.SessionID, h.Name(), p.Dir, nativeID, p.OpID)
+	intentHash, err := intentFingerprint("create", p.SessionID, h.Name(), p.Dir, p.Prompt)
+	if err != nil {
+		return Execution{}, err
+	}
+	bindingID, run, created, err := db.BeginFirstRun(ctx, p.RunID, p.SessionID, h.Name(), p.Dir, nativeID, p.OpID, intentHash)
 	if err != nil {
 		return Execution{}, err
 	}
 	if !created {
-		return Execution{}, fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
+		if run.Dispatch != store.DispatchPending || run.Outcome.Valid {
+			return Execution{}, fmt.Errorf("runner: op %q already has a dispatched or finished run %q; not launching again", p.OpID, run.ID)
+		}
+		binding, err := db.ActiveBinding(ctx, p.SessionID)
+		if err != nil {
+			return Execution{}, err
+		}
+		if !run.BindingID.Valid || binding.ID != run.BindingID.Int64 || binding.Harness != h.Name() {
+			return Execution{}, fmt.Errorf("runner: pending op %q no longer owns the active binding", p.OpID)
+		}
+		bindingID = binding.ID
+		nativeID = binding.NativeID
 	}
-	if err := db.AuthorizeDispatch(ctx, p.RunID); err != nil {
+	if err := db.AuthorizeDispatch(ctx, run.ID); err != nil {
 		return Execution{}, err
 	}
-	return executeAuthorized(ctx, db, h, bindingID, p.RunID, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt})
+	return executeAuthorized(ctx, db, h, bindingID, run.ID, Request{Dir: p.Dir, NativeID: nativeID, Prompt: p.Prompt})
 }
 
 // Resume starts a new Run on the active native binding of the same logical session.
@@ -107,12 +127,16 @@ func ResumeWithOutput(ctx context.Context, db *store.DB, h Harness, p ResumePara
 	if binding.NativeID == "" {
 		return Execution{}, fmt.Errorf("runner: session %q has no recorded native id; cannot resume", p.SessionID)
 	}
-	run, created, err := db.BeginRun(ctx, p.RunID, p.SessionID, binding.ID, p.OpID)
+	intentHash, err := intentFingerprint("resume", p.SessionID, h.Name(), fmt.Sprint(binding.ID), binding.NativeID, binding.WorkingDir, p.Prompt)
 	if err != nil {
 		return Execution{}, err
 	}
-	if !created {
-		return Execution{}, fmt.Errorf("runner: op %q already has run %q; not launching again", p.OpID, run.ID)
+	run, created, err := db.BeginRun(ctx, p.RunID, p.SessionID, binding.ID, p.OpID, intentHash)
+	if err != nil {
+		return Execution{}, err
+	}
+	if !created && (run.Dispatch != store.DispatchPending || run.Outcome.Valid) {
+		return Execution{}, fmt.Errorf("runner: op %q already has a dispatched or finished run %q; not launching again", p.OpID, run.ID)
 	}
 	if err := db.AuthorizeDispatch(ctx, run.ID); err != nil {
 		return Execution{}, err
@@ -137,7 +161,8 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 		RunID: p.RunID, OpID: p.OpID, WorkID: p.WorkID, MainSessionID: work.MainSessionID,
 		ConversationID: p.ConversationID, MailboxSequence: p.MailboxSequence, SourceMessageID: p.MessageID,
 		Harness: h.Name(), WorkingDir: p.WorkingDir, NativeID: h.NewNativeID(),
-		InputSnapshot: p.InputSnapshot, ContextRevision: p.ContextRevision,
+		AllowBindingReplacement: p.CrossHarnessExperiment,
+		InputSnapshot:           p.InputSnapshot, ContextRevision: p.ContextRevision,
 	}
 	req := Request{Dir: p.WorkingDir, NativeID: start.NativeID, Prompt: p.Prompt}
 	if err == nil {
@@ -148,8 +173,15 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 			start.BindingID = binding.ID
 			start.NativeID = binding.NativeID
 			req = Request{Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true}
+		} else if !p.CrossHarnessExperiment {
+			return Execution{}, fmt.Errorf("runner: Main session %q is bound to %q; cross-Harness rebuild requires an explicit experiment", work.MainSessionID, binding.Harness)
 		}
 	}
+	intentHash, err := intentFingerprint("main", p.WorkID, p.ConversationID, p.MessageID, p.InputSnapshot, h.Name(), req.Dir, req.NativeID, fmt.Sprint(req.Resume), req.Prompt)
+	if err != nil {
+		return Execution{}, err
+	}
+	start.IntentHash = intentHash
 	bindingID, err := db.BeginMainRun(ctx, start)
 	if err != nil {
 		return Execution{}, err
@@ -158,7 +190,17 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 	if runErr != nil || execution.Outcome == "" {
 		execution.Outcome = outcome.Unknown
 	}
-	finishErr := db.CompleteMainRun(context.WithoutCancel(ctx), p.RunID, p.ReplyID, execution.Text, execution.Outcome)
+	completion := store.MainCompletion{ReplyID: p.ReplyID, Reply: execution.Text, Result: "completed"}
+	if execution.Outcome != outcome.Unknown && p.DecodeReply != nil {
+		decoded, decodeErr := p.DecodeReply(execution.Text)
+		if decodeErr != nil {
+			completion = store.MainCompletion{ReplyID: p.ReplyID, Reply: execution.Text, Result: "failed", ResultDetail: "invalid_main_response"}
+		} else {
+			completion = decoded
+			completion.ReplyID = p.ReplyID
+		}
+	}
+	finishErr := db.CompleteMainRun(context.WithoutCancel(ctx), p.RunID, completion, execution.Outcome)
 	if finishErr != nil {
 		return Execution{Outcome: outcome.Unknown}, errors.Join(runErr, finishErr)
 	}
@@ -205,4 +247,13 @@ func runHarness(ctx context.Context, db *store.DB, h Harness, bindingID int64, r
 		execution.Outcome = outcome.Unknown
 	}
 	return execution, errors.Join(runErr, idErr)
+}
+
+func intentFingerprint(kind string, values ...string) (string, error) {
+	encoded, err := json.Marshal(append([]string{kind}, values...))
+	if err != nil {
+		return "", fmt.Errorf("runner: encode operation intent: %w", err)
+	}
+	fingerprint := sha256.Sum256(encoded)
+	return hex.EncodeToString(fingerprint[:]), nil
 }

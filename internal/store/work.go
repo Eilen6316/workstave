@@ -11,6 +11,8 @@ import (
 type Work struct {
 	ID              string
 	MainSessionID   string
+	MainHarness     string
+	WorkingDir      string
 	Revision        int64
 	ControllerEpoch int64
 	CreatedAt       int64
@@ -33,12 +35,13 @@ type FactProposal struct {
 
 // WorkFact is a versioned, sourced Work state record.
 type WorkFact struct {
-	Kind            string
-	Key             string
-	Value           string
-	Status          string
-	Revision        int64
-	SourceMessageID string
+	Kind              string
+	Key               string
+	Value             string
+	Status            string
+	Revision          int64
+	SourceMessageID   string
+	ConfirmationBasis string
 }
 
 // ContextMessage is a prior message from the current Conversation only.
@@ -60,6 +63,14 @@ type MainContext struct {
 
 // CreateWork creates the Work and its stable logical Main session atomically.
 func (d *DB) CreateWork(ctx context.Context, workID, mainSessionID string) error {
+	return d.CreateWorkWithHarness(ctx, workID, mainSessionID, "codex", "")
+}
+
+// CreateWorkWithHarness selects the Main Harness used for ordinary Conversation messages.
+func (d *DB) CreateWorkWithHarness(ctx context.Context, workID, mainSessionID, mainHarness, workingDir string) error {
+	if mainHarness != "codex" && mainHarness != "claude-code" {
+		return fmt.Errorf("store: unsupported Main harness %q", mainHarness)
+	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin work %q: %w", workID, err)
@@ -71,7 +82,7 @@ func (d *DB) CreateWork(ctx context.Context, workID, mainSessionID string) error
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions(id, work_id, role, created_at) VALUES (?,?,'main',?)`, mainSessionID, workID, nowMS()); err != nil {
 		return fmt.Errorf("store: create Main session for work %q: %w", workID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO works(id, main_session_id, created_at) VALUES (?,?,?)`, workID, mainSessionID, nowMS()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO works(id, main_session_id, main_harness, working_dir, created_at) VALUES (?,?,?,?,?)`, workID, mainSessionID, mainHarness, workingDir, nowMS()); err != nil {
 		return fmt.Errorf("store: create work %q: %w", workID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -83,8 +94,8 @@ func (d *DB) CreateWork(ctx context.Context, workID, mainSessionID string) error
 // Work returns one persisted Work and its stable Main session identity.
 func (d *DB) Work(ctx context.Context, workID string) (Work, error) {
 	var w Work
-	err := d.sql.QueryRowContext(ctx, `SELECT id, main_session_id, revision, controller_epoch, created_at FROM works WHERE id = ?`, workID).
-		Scan(&w.ID, &w.MainSessionID, &w.Revision, &w.ControllerEpoch, &w.CreatedAt)
+	err := d.sql.QueryRowContext(ctx, `SELECT id, main_session_id, main_harness, working_dir, revision, controller_epoch, created_at FROM works WHERE id = ?`, workID).
+		Scan(&w.ID, &w.MainSessionID, &w.MainHarness, &w.WorkingDir, &w.Revision, &w.ControllerEpoch, &w.CreatedAt)
 	if err != nil {
 		return Work{}, fmt.Errorf("store: work %q: %w", workID, err)
 	}
@@ -124,7 +135,7 @@ func (d *DB) MainContext(ctx context.Context, workID, conversationID string, bef
 	if err != nil {
 		return MainContext{}, fmt.Errorf("store: Main context Work %q: %w", workID, err)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id
+	rows, err := tx.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id, confirmation_basis
 		FROM work_facts WHERE work_id = ? AND status IN ('confirmed','candidate')
 		ORDER BY kind, fact_key, revision`, workID)
 	if err != nil {
@@ -132,7 +143,7 @@ func (d *DB) MainContext(ctx context.Context, workID, conversationID string, bef
 	}
 	for rows.Next() {
 		var f WorkFact
-		if err := rows.Scan(&f.Kind, &f.Key, &f.Value, &f.Status, &f.Revision, &f.SourceMessageID); err != nil {
+		if err := rows.Scan(&f.Kind, &f.Key, &f.Value, &f.Status, &f.Revision, &f.SourceMessageID, &f.ConfirmationBasis); err != nil {
 			_ = rows.Close()
 			return MainContext{}, fmt.Errorf("store: scan Work fact: %w", err)
 		}
@@ -179,7 +190,7 @@ func (d *DB) MainContext(ctx context.Context, workID, conversationID string, bef
 
 // WorkFacts lists the current confirmed and candidate records without conversation history.
 func (d *DB) WorkFacts(ctx context.Context, workID string) ([]WorkFact, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id
+	rows, err := d.sql.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id, confirmation_basis
 		FROM work_facts WHERE work_id = ? AND status IN ('confirmed','candidate')
 		ORDER BY kind, fact_key, revision`, workID)
 	if err != nil {
@@ -189,7 +200,7 @@ func (d *DB) WorkFacts(ctx context.Context, workID string) ([]WorkFact, error) {
 	var facts []WorkFact
 	for rows.Next() {
 		var f WorkFact
-		if err := rows.Scan(&f.Kind, &f.Key, &f.Value, &f.Status, &f.Revision, &f.SourceMessageID); err != nil {
+		if err := rows.Scan(&f.Kind, &f.Key, &f.Value, &f.Status, &f.Revision, &f.SourceMessageID, &f.ConfirmationBasis); err != nil {
 			return nil, fmt.Errorf("store: scan Work fact: %w", err)
 		}
 		facts = append(facts, f)
@@ -200,11 +211,55 @@ func (d *DB) WorkFacts(ctx context.Context, workID string) ([]WorkFact, error) {
 	return facts, nil
 }
 
+// WorkFactVersions lists every current and superseded version for one Work.
+func (d *DB) WorkFactVersions(ctx context.Context, workID string) ([]WorkFact, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id, confirmation_basis
+		FROM work_facts WHERE work_id = ? ORDER BY kind, fact_key, revision`, workID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list Work fact versions %q: %w", workID, err)
+	}
+	defer rows.Close()
+	var facts []WorkFact
+	for rows.Next() {
+		var fact WorkFact
+		if err := rows.Scan(&fact.Kind, &fact.Key, &fact.Value, &fact.Status, &fact.Revision, &fact.SourceMessageID, &fact.ConfirmationBasis); err != nil {
+			return nil, fmt.Errorf("store: scan Work fact version: %w", err)
+		}
+		facts = append(facts, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list Work fact versions: %w", err)
+	}
+	return facts, nil
+}
+
+// WorkFactHistory returns every version of one fact, including superseded values.
+func (d *DB) WorkFactHistory(ctx context.Context, workID, kind, key string) ([]WorkFact, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT kind, fact_key, value, status, revision, source_message_id, confirmation_basis
+		FROM work_facts WHERE work_id = ? AND kind = ? AND fact_key = ? ORDER BY revision`, workID, kind, key)
+	if err != nil {
+		return nil, fmt.Errorf("store: read Work fact history %q/%q: %w", kind, key, err)
+	}
+	defer rows.Close()
+	var history []WorkFact
+	for rows.Next() {
+		var fact WorkFact
+		if err := rows.Scan(&fact.Kind, &fact.Key, &fact.Value, &fact.Status, &fact.Revision, &fact.SourceMessageID, &fact.ConfirmationBasis); err != nil {
+			return nil, fmt.Errorf("store: scan Work fact history: %w", err)
+		}
+		history = append(history, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read Work fact history: %w", err)
+	}
+	return history, nil
+}
+
 // ConversationMessages returns one Conversation's messages in submission order, including
 // the mailbox state of each user input.
 func (d *DB) ConversationMessages(ctx context.Context, conversationID string) ([]Message, error) {
 	rows, err := d.sql.QueryContext(ctx, `SELECT m.id, m.work_id, m.conversation_id, m.role, m.body,
-		COALESCE(m.reply_to,''), m.created_at, COALESCE(b.state,'completed')
+		COALESCE(m.reply_to,''), m.created_at, COALESCE(b.state,'completed'), COALESCE(b.result,''), COALESCE(b.result_detail,'')
 		FROM messages m LEFT JOIN mailbox b ON b.message_id = CASE WHEN m.role = 'user' THEN m.id ELSE m.reply_to END
 	WHERE m.conversation_id = ? ORDER BY COALESCE(b.sequence, 0), CASE m.role WHEN 'assistant' THEN 1 ELSE 0 END, m.id`, conversationID)
 	if err != nil {
@@ -214,7 +269,8 @@ func (d *DB) ConversationMessages(ctx context.Context, conversationID string) ([
 	var messages []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.WorkID, &m.ConversationID, &m.Role, &m.Body, &m.ReplyTo, &m.CreatedAt, &m.MailboxState); err != nil {
+		if err := rows.Scan(&m.ID, &m.WorkID, &m.ConversationID, &m.Role, &m.Body, &m.ReplyTo, &m.CreatedAt,
+			&m.MailboxState, &m.MailboxResult, &m.MailboxResultDetail); err != nil {
 			return nil, fmt.Errorf("store: scan Conversation message: %w", err)
 		}
 		messages = append(messages, m)
@@ -227,19 +283,23 @@ func (d *DB) ConversationMessages(ctx context.Context, conversationID string) ([
 
 // Message is a persisted Conversation message. MailboxState is empty for assistant messages.
 type Message struct {
-	ID             string
-	WorkID         string
-	ConversationID string
-	Role           string
-	Body           string
-	ReplyTo        string
-	CreatedAt      int64
-	MailboxState   string
+	ID                  string
+	WorkID              string
+	ConversationID      string
+	Role                string
+	Body                string
+	ReplyTo             string
+	CreatedAt           int64
+	MailboxState        string
+	MailboxResult       string
+	MailboxResultDetail string
 }
 
 // MainRun is the causal association between one accepted input and one runner Run.
 type MainRun struct {
 	RunID           string
+	OpID            string
+	Dispatch        string
 	WorkID          string
 	ConversationID  string
 	MailboxSequence int64
@@ -256,11 +316,11 @@ type MainRun struct {
 // MainRunForMessage returns the Main Run associated with a source Message, if one exists.
 func (d *DB) MainRunForMessage(ctx context.Context, messageID string) (MainRun, bool, error) {
 	var r MainRun
-	err := d.sql.QueryRowContext(ctx, `SELECT mr.run_id, mr.work_id, mr.conversation_id, mr.mailbox_sequence,
+	err := d.sql.QueryRowContext(ctx, `SELECT mr.run_id, r.op_id, r.dispatch, mr.work_id, mr.conversation_id, mr.mailbox_sequence,
 		mr.source_message_id, mr.input_snapshot, mr.context_revision, mr.controller_epoch,
 		COALESCE(mr.output_message_id,''), mr.started_at, r.ended_at, r.outcome
 		FROM main_runs mr JOIN runs r ON r.id = mr.run_id WHERE mr.source_message_id = ?`, messageID).
-		Scan(&r.RunID, &r.WorkID, &r.ConversationID, &r.MailboxSequence, &r.SourceMessageID,
+		Scan(&r.RunID, &r.OpID, &r.Dispatch, &r.WorkID, &r.ConversationID, &r.MailboxSequence, &r.SourceMessageID,
 			&r.InputSnapshot, &r.ContextRevision, &r.ControllerEpoch, &r.OutputMessageID,
 			&r.StartedAt, &r.EndedAt, &r.Outcome)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -270,4 +330,31 @@ func (d *DB) MainRunForMessage(ctx context.Context, messageID string) (MainRun, 
 		return MainRun{}, false, fmt.Errorf("store: Main Run for message %q: %w", messageID, err)
 	}
 	return r, true, nil
+}
+
+// UnresolvedMainRuns returns Main executions that still require observation or reconciliation.
+func (d *DB) UnresolvedMainRuns(ctx context.Context, workID string) ([]MainRun, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT mr.run_id, r.op_id, r.dispatch, mr.work_id, mr.conversation_id,
+		mr.mailbox_sequence, mr.source_message_id, mr.input_snapshot, mr.context_revision, mr.controller_epoch,
+		COALESCE(mr.output_message_id,''), mr.started_at, r.ended_at, r.outcome
+		FROM main_runs mr JOIN runs r ON r.id = mr.run_id
+		WHERE mr.work_id = ? AND (r.outcome IS NULL OR r.outcome = 'unknown') ORDER BY mr.started_at, mr.run_id`, workID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list unresolved Main Runs for Work %q: %w", workID, err)
+	}
+	defer rows.Close()
+	var runs []MainRun
+	for rows.Next() {
+		var run MainRun
+		if err := rows.Scan(&run.RunID, &run.OpID, &run.Dispatch, &run.WorkID, &run.ConversationID,
+			&run.MailboxSequence, &run.SourceMessageID, &run.InputSnapshot, &run.ContextRevision,
+			&run.ControllerEpoch, &run.OutputMessageID, &run.StartedAt, &run.EndedAt, &run.Outcome); err != nil {
+			return nil, fmt.Errorf("store: scan unresolved Main Run: %w", err)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read unresolved Main Runs: %w", err)
+	}
+	return runs, nil
 }

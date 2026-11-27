@@ -23,8 +23,23 @@ type inputSnapshot struct {
 	CurrentInput   string            `json:"current_input"`
 }
 
-// ConfirmedFacts extracts only explicitly marked requirement and decision lines. Questions,
-// discussion and hypotheses stay in the message history and cannot replace confirmed facts.
+type structuredChange struct {
+	Kind             string `json:"kind"`
+	Key              string `json:"key"`
+	Value            string `json:"value"`
+	Status           string `json:"status"`
+	Basis            string `json:"basis"`
+	Evidence         string `json:"evidence"`
+	ExpectedRevision int64  `json:"expected_revision"`
+}
+
+type structuredReply struct {
+	Reply   string             `json:"reply"`
+	Changes []structuredChange `json:"changes"`
+}
+
+// ConfirmedFacts parses an explicit fixture format for deterministic tests. Accept does not
+// call it for ordinary user messages.
 func ConfirmedFacts(body string) []store.FactProposal {
 	matches := factLine.FindAllStringSubmatch(body, -1)
 	proposals := make([]store.FactProposal, 0, len(matches))
@@ -46,15 +61,24 @@ func ConfirmedFacts(body string) []store.FactProposal {
 }
 
 // Accept records one independently identified Conversation message and its Mailbox entry.
-func Accept(ctx context.Context, db *store.DB, messageID, conversationID, harness, body string) (store.MailboxItem, error) {
-	return db.AcceptUserMessage(ctx, messageID, conversationID, harness, body, ConfirmedFacts(body))
+func Accept(ctx context.Context, db *store.DB, messageID, conversationID, body string) (store.MailboxItem, error) {
+	return db.AcceptUserMessage(ctx, messageID, conversationID, body, nil)
+}
+
+// AcceptCrossHarnessExperiment explicitly records an input that requests a Main Harness rebuild.
+func AcceptCrossHarnessExperiment(ctx context.Context, db *store.DB, messageID, conversationID, harness, body string) (store.MailboxItem, error) {
+	return db.AcceptHarnessExperiment(ctx, messageID, conversationID, harness, body)
 }
 
 // ProcessPending handles queued inputs in Work sequence order. It stops on an unknown Run so
 // the next input cannot be blindly applied to an unresolved Main execution.
 func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string, harness func(name string) (runner.Harness, error)) error {
-	if err := db.RecoverMailboxOnStart(ctx); err != nil {
+	work, err := db.Work(ctx, workID)
+	if err != nil {
 		return err
+	}
+	if work.WorkingDir != "" {
+		workingDir = work.WorkingDir
 	}
 	for {
 		item, found, err := db.ClaimNextMailbox(ctx, workID)
@@ -84,8 +108,9 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 		_, err = runner.ProcessMainMessage(ctx, db, h, runner.MainParams{
 			WorkID: workID, ConversationID: item.ConversationID, MailboxSequence: item.Sequence,
 			MessageID: item.MessageID, ReplyID: "reply-" + item.MessageID,
-			RunID: runID, OpID: "main-" + item.MessageID, WorkingDir: workingDir,
+			RunID: runID, OpID: item.OpID, WorkingDir: workingDir,
 			InputSnapshot: string(encoded), ContextRevision: state.Revision, Prompt: prompt,
+			DecodeReply: decodeMainReply, CrossHarnessExperiment: item.CrossHarnessExperiment,
 		})
 		if err != nil {
 			mainRun, found, lookupErr := db.MainRunForMessage(ctx, item.MessageID)
@@ -104,6 +129,9 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 		if mailbox.State == "unknown" {
 			return fmt.Errorf("workflow: Main Run for message %q is unknown; later messages remain queued", item.MessageID)
 		}
+		if mailbox.Result == "failed" {
+			return fmt.Errorf("workflow: message %q was consumed with failure %q; later messages remain queued", item.MessageID, mailbox.ResultDetail)
+		}
 	}
 }
 
@@ -116,7 +144,7 @@ func errorsReturnPending(ctx context.Context, db *store.DB, sequence int64, caus
 
 func compilePrompt(input inputSnapshot) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "You are the Main for Work %s. Answer the current user using the authoritative Work State below. Do not claim a candidate as confirmed. Keep this user's reply in their Conversation.\n", input.Context.WorkID)
+	fmt.Fprintf(&b, "You are the Main for Work %s. Return one JSON object with keys reply and changes. Each change must have kind, key, value, status, basis, evidence, and expected_revision. Use status confirmed only for a clear user requirement or decision. Use basis explicit_user_statement for that case and set evidence to an exact quote from the current user message. Questions and discussions may create candidate changes with basis discussion and an exact quote in evidence, but never replace a confirmed fact. Use basis model_inference for unverified model conclusions and keep them candidate. expected_revision is the latest revision shown for that same fact key, or 0 if none is shown. Use an empty changes array when no state change is justified. The source message is supplied by the Kernel and must not be invented. Keep the reply in this Conversation.\n", input.Context.WorkID)
 	fmt.Fprintf(&b, "Work revision %d. Confirmed facts:\n", input.Context.Revision)
 	hasConfirmed := false
 	for _, fact := range input.Context.Facts {
@@ -124,14 +152,14 @@ func compilePrompt(input inputSnapshot) string {
 			continue
 		}
 		hasConfirmed = true
-		fmt.Fprintf(&b, "- %s %s, revision %d, source message %s: %s\n", fact.Kind, fact.Key, fact.Revision, fact.SourceMessageID, fact.Value)
+		fmt.Fprintf(&b, "- %s %s, revision %d, source message %s, basis %s: %s\n", fact.Kind, fact.Key, fact.Revision, fact.SourceMessageID, fact.ConfirmationBasis, fact.Value)
 	}
 	if !hasConfirmed {
 		b.WriteString("- none\n")
 	}
 	for _, fact := range input.Context.Facts {
 		if fact.Status == "candidate" {
-			fmt.Fprintf(&b, "Candidate %s %s, source message %s: %s\n", fact.Kind, fact.Key, fact.SourceMessageID, fact.Value)
+			fmt.Fprintf(&b, "Candidate %s %s, revision %d, source message %s, basis %s: %s\n", fact.Kind, fact.Key, fact.Revision, fact.SourceMessageID, fact.ConfirmationBasis, fact.Value)
 		}
 	}
 	if len(input.Context.History) != 0 {
@@ -141,8 +169,29 @@ func compilePrompt(input inputSnapshot) string {
 		}
 	}
 	fmt.Fprintf(&b, "Current user message from Conversation %s:\n%s\n", input.ConversationID, input.CurrentInput)
-	b.WriteString("Answer directly. Do not use tools for this request.")
+	b.WriteString("Return JSON only. Do not use tools for this request.")
 	return b.String()
+}
+
+func decodeMainReply(text string) (store.MainCompletion, error) {
+	var response structuredReply
+	if err := json.Unmarshal([]byte(text), &response); err != nil {
+		return store.MainCompletion{}, fmt.Errorf("workflow: decode Main response: %w", err)
+	}
+	if strings.TrimSpace(response.Reply) == "" {
+		return store.MainCompletion{}, fmt.Errorf("workflow: Main response has no reply")
+	}
+	if response.Changes == nil {
+		return store.MainCompletion{}, fmt.Errorf("workflow: Main response has no changes array")
+	}
+	changes := make([]store.WorkChange, 0, len(response.Changes))
+	for _, change := range response.Changes {
+		changes = append(changes, store.WorkChange{
+			Kind: change.Kind, Key: change.Key, Value: change.Value, Status: change.Status,
+			Basis: change.Basis, Evidence: change.Evidence, ExpectedRevision: change.ExpectedRevision,
+		})
+	}
+	return store.MainCompletion{Reply: response.Reply, Changes: changes, Result: "completed"}, nil
 }
 
 func newID(prefix string) (string, error) {

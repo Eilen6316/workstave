@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"workstave/internal/outcome"
@@ -17,8 +18,38 @@ type fakeHarness struct {
 	nativeID  string
 	ackID     string
 	result    runner.Execution
+	responses []runner.Execution
 	requests  []runner.Request
 	callCount int
+	during    func()
+}
+
+type blockingHarness struct {
+	mu       sync.Mutex
+	started  chan struct{}
+	release  chan struct{}
+	calls    int
+	requests []runner.Request
+}
+
+func (h *blockingHarness) Name() string        { return "codex" }
+func (h *blockingHarness) NewNativeID() string { return "" }
+func (h *blockingHarness) Execute(_ context.Context, request runner.Request, acknowledged func(string)) (runner.Execution, error) {
+	h.mu.Lock()
+	h.calls++
+	call := h.calls
+	h.requests = append(h.requests, request)
+	h.mu.Unlock()
+	nativeID := request.NativeID
+	if nativeID == "" {
+		nativeID = "thread-1"
+	}
+	acknowledged(nativeID)
+	if call == 1 {
+		close(h.started)
+		<-h.release
+	}
+	return runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"processed","changes":[]}`}, nil
 }
 
 func (h *fakeHarness) Name() string        { return h.name }
@@ -26,8 +57,14 @@ func (h *fakeHarness) NewNativeID() string { return h.nativeID }
 func (h *fakeHarness) Execute(_ context.Context, request runner.Request, acknowledged func(string)) (runner.Execution, error) {
 	h.callCount++
 	h.requests = append(h.requests, request)
+	if h.during != nil {
+		h.during()
+	}
 	if h.ackID != "" {
 		acknowledged(h.ackID)
+	}
+	if h.callCount <= len(h.responses) {
+		return h.responses[h.callCount-1], nil
 	}
 	return h.result, nil
 }
@@ -45,7 +82,7 @@ func openWorkflowStore(t *testing.T) *store.DB {
 func TestTwoConversationsShareWorkFactsAndKeepHistorySeparate(t *testing.T) {
 	ctx := context.Background()
 	db := openWorkflowStore(t)
-	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
+	if err := db.CreateWorkWithHarness(ctx, "work-1", "main-1", "claude-code", "/work"); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"conversation-a", "conversation-b"} {
@@ -53,15 +90,17 @@ func TestTwoConversationsShareWorkFactsAndKeepHistorySeparate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := Accept(ctx, db, "message-a", "conversation-a", "claude-code", "Confirmed requirement inventory_format: weekly report is TSV.\nConversation A only: planning note delta-zebra."); err != nil {
+	a, err := db.AcceptUserMessage(ctx, "message-a", "conversation-a", "Confirmed requirement inventory_format: weekly report is TSV.\nConversation A only: planning note delta-zebra.", ConfirmedFacts("Confirmed requirement inventory_format: weekly report is TSV."))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Accept(ctx, db, "message-b", "conversation-b", "codex", "What report format was agreed? I do not have the earlier details."); err != nil {
+	b, err := AcceptCrossHarnessExperiment(ctx, db, "message-b", "conversation-b", "codex", "What report format was agreed? I do not have the earlier details.")
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	claude := &fakeHarness{name: "claude-code", nativeID: "native-a", ackID: "native-a", result: runner.Execution{Outcome: outcome.Completed, Text: "Recorded the weekly TSV requirement."}}
-	codex := &fakeHarness{name: "codex", ackID: "thread-b", result: runner.Execution{Outcome: outcome.Completed, Text: "The weekly report should be TSV."}}
+	claude := &fakeHarness{name: "claude-code", nativeID: "native-a", ackID: "native-a", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"Recorded the weekly TSV requirement.","changes":[]}`}}
+	codex := &fakeHarness{name: "codex", ackID: "thread-b", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"The weekly report should be TSV.","changes":[]}`}}
 	if err := ProcessPending(ctx, db, "work-1", "/work", func(name string) (runner.Harness, error) {
 		switch name {
 		case "claude-code":
@@ -96,6 +135,16 @@ func TestTwoConversationsShareWorkFactsAndKeepHistorySeparate(t *testing.T) {
 			t.Fatalf("Mailbox for %q = %+v err=%v", inputID, mailbox, err)
 		}
 	}
+	for _, accepted := range []store.MailboxItem{a, b} {
+		run, found, err := db.RunForOp(ctx, accepted.OpID)
+		if err != nil || !found {
+			t.Fatalf("stable Mailbox operation %q did not produce its Run: found=%v err=%v", accepted.OpID, found, err)
+		}
+		mainRun, found, err := db.MainRunForMessage(ctx, accepted.MessageID)
+		if err != nil || !found || mainRun.RunID != run.ID {
+			t.Fatalf("operation %q Main Run=%+v Run=%+v found=%v err=%v", accepted.OpID, mainRun, run, found, err)
+		}
+	}
 	mainRunB, _, err := db.MainRunForMessage(ctx, "message-b")
 	if err != nil {
 		t.Fatal(err)
@@ -118,13 +167,13 @@ func TestPausedWorkReturnsUnstartedMailboxInputToPending(t *testing.T) {
 	if err := db.CreateConversation(ctx, "conversation-a", "work-1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Accept(ctx, db, "message-a", "conversation-a", "codex", "Please check status."); err != nil {
+	if _, err := Accept(ctx, db, "message-a", "conversation-a", "Please check status."); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetWorkPaused(ctx, "work-1", true); err != nil {
 		t.Fatal(err)
 	}
-	harness := &fakeHarness{name: "codex", result: runner.Execution{Outcome: outcome.Completed, Text: "done"}}
+	harness := &fakeHarness{name: "codex", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"done","changes":[]}`}}
 	err := ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil })
 	if err == nil || harness.callCount != 0 {
 		t.Fatalf("ProcessPending err=%v harness calls=%d, want pause error and no launch", err, harness.callCount)
@@ -138,7 +187,7 @@ func TestPausedWorkReturnsUnstartedMailboxInputToPending(t *testing.T) {
 	}
 }
 
-func TestUnknownMainRunStopsLaterMailboxInput(t *testing.T) {
+func TestPauseAfterMainAuthorizationFinishesInFlightAndBlocksNextInput(t *testing.T) {
 	ctx := context.Background()
 	db := openWorkflowStore(t)
 	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
@@ -148,9 +197,61 @@ func TestUnknownMainRunStopsLaterMailboxInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"message-a", "message-b"} {
-		if _, err := Accept(ctx, db, id, "conversation-a", "codex", "Check status."); err != nil {
+		if _, err := Accept(ctx, db, id, "conversation-a", "Continue the work."); err != nil {
 			t.Fatal(err)
 		}
+	}
+	harness := &blockingHarness{started: make(chan struct{}), release: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		result <- ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil })
+	}()
+	<-harness.started
+	if err := db.SetWorkPaused(ctx, "work-1", true); err != nil {
+		t.Fatal(err)
+	}
+	close(harness.release)
+	if err := <-result; err == nil {
+		t.Fatal("second Main input unexpectedly dispatched after Pause")
+	}
+	first, err := db.MailboxByMessage(ctx, "message-a")
+	if err != nil || first.Result != "completed" {
+		t.Fatalf("authorized in-flight input=%+v err=%v", first, err)
+	}
+	second, err := db.MailboxByMessage(ctx, "message-b")
+	if err != nil || second.State != "pending" || second.Result != "" {
+		t.Fatalf("paused next input=%+v err=%v", second, err)
+	}
+	if _, found, err := db.MainRunForMessage(ctx, "message-b"); err != nil || found {
+		t.Fatalf("paused input got a Main Run: found=%v err=%v", found, err)
+	}
+	workIDs, err := db.PendingWorkIDs(ctx)
+	if err != nil || len(workIDs) != 0 {
+		t.Fatalf("paused pending Works=%v err=%v", workIDs, err)
+	}
+	if err := db.SetWorkPaused(ctx, "work-1", false); err != nil {
+		t.Fatal(err)
+	}
+	workIDs, err = db.PendingWorkIDs(ctx)
+	if err != nil || len(workIDs) != 1 || workIDs[0] != "work-1" {
+		t.Fatalf("unpaused pending Works=%v err=%v", workIDs, err)
+	}
+}
+
+func TestUnknownMainRunStopsLaterMailboxInput(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conversation-a", "work-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Accept(ctx, db, "message-a", "conversation-a", "Check status."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptUserMessage(ctx, "message-b", "conversation-a", "Confirmed requirement auth_method: use JWT.", ConfirmedFacts("Confirmed requirement auth_method: use JWT.")); err != nil {
+		t.Fatal(err)
 	}
 	harness := &fakeHarness{name: "codex", ackID: "thread-a", result: runner.Execution{Outcome: outcome.Unknown}}
 	if err := ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil }); err == nil {
@@ -166,5 +267,125 @@ func TestUnknownMainRunStopsLaterMailboxInput(t *testing.T) {
 	second, err := db.MailboxByMessage(ctx, "message-b")
 	if err != nil || second.State != "pending" {
 		t.Fatalf("second Mailbox=%+v err=%v, want pending", second, err)
+	}
+	if _, found, err := db.ClaimNextMailbox(ctx, "work-1"); err != nil || found {
+		t.Fatalf("unknown Main Run allowed a later claim: found=%v err=%v", found, err)
+	}
+	if _, found, err := db.WorkFactByKey(ctx, "work-1", "requirement", "auth_method"); err != nil || found {
+		t.Fatalf("later fact was applied behind an unresolved Main Run: found=%v err=%v", found, err)
+	}
+	if err := db.CreateWork(ctx, "work-2", "main-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conversation-c", "work-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Accept(ctx, db, "message-c", "conversation-c", "Independent Work remains available."); err != nil {
+		t.Fatal(err)
+	}
+	workIDs, err := db.PendingWorkIDs(ctx)
+	if err != nil || len(workIDs) != 1 || workIDs[0] != "work-2" {
+		t.Fatalf("unknown Main Run blocked unrelated Work: pending=%v err=%v", workIDs, err)
+	}
+}
+
+func TestConcurrentProcessorsDoNotRecoverOrApplyNextMessage(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conversation-a", "work-1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Accept(ctx, db, "message-a", "conversation-a", "Check the status.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.AcceptUserMessage(ctx, "message-b", "conversation-a", "Confirmed requirement auth_method: use JWT.", ConfirmedFacts("Confirmed requirement auth_method: use JWT."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := &blockingHarness{started: make(chan struct{}), release: make(chan struct{})}
+	process := func() error {
+		return ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil })
+	}
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- process() }()
+	<-harness.started
+
+	if err := process(); err != nil {
+		t.Errorf("second processor returned while the first owned the Work: %v", err)
+	}
+	firstState, err := db.MailboxByMessage(ctx, "message-a")
+	if err != nil || firstState.State != "processing" {
+		t.Errorf("active Mailbox input = %+v err=%v, want processing", firstState, err)
+	}
+	secondState, err := db.MailboxByMessage(ctx, "message-b")
+	if err != nil || secondState.State != "pending" {
+		t.Errorf("next Mailbox input = %+v err=%v, want pending", secondState, err)
+	}
+	if _, found, err := db.WorkFactByKey(ctx, "work-1", "requirement", "auth_method"); err != nil || found {
+		t.Errorf("next input's fact was applied before Main reached it: found=%v err=%v", found, err)
+	}
+
+	close(harness.release)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first processor: %v", err)
+	}
+	for _, input := range []struct {
+		message string
+		seq     int64
+	}{{"message-a", first.Sequence}, {"message-b", second.Sequence}} {
+		item, err := db.MailboxByMessage(ctx, input.message)
+		if err != nil || item.State != "completed" {
+			t.Fatalf("Mailbox %s = %+v err=%v, want completed", input.message, item, err)
+		}
+		mainRun, found, err := db.MainRunForMessage(ctx, input.message)
+		if err != nil || !found || mainRun.MailboxSequence != input.seq {
+			t.Fatalf("Main Run for %s = %+v found=%v err=%v", input.message, mainRun, found, err)
+		}
+	}
+	harness.mu.Lock()
+	calls := harness.calls
+	harness.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("Harness calls=%d, want one ordered call per message", calls)
+	}
+	if fact, found, err := db.WorkFactByKey(ctx, "work-1", "requirement", "auth_method"); err != nil || !found || fact.Value != "use JWT." {
+		t.Fatalf("second input fact = %+v found=%v err=%v", fact, found, err)
+	}
+}
+
+func TestBusyWorkDoesNotBlockAnotherWork(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	for _, id := range []string{"work-a", "work-b"} {
+		if err := db.CreateWork(ctx, id, "main-"+id); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.CreateConversation(ctx, "conv-"+id, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Accept(ctx, db, "message-"+id, "conv-"+id, "Process this independent Work."); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := &blockingHarness{started: make(chan struct{}), release: make(chan struct{})}
+	blockedResult := make(chan error, 1)
+	go func() {
+		blockedResult <- ProcessPending(ctx, db, "work-a", "/work-a", func(string) (runner.Harness, error) { return blocked, nil })
+	}()
+	<-blocked.started
+	other := &fakeHarness{name: "codex", ackID: "thread-b", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"done","changes":[]}`}}
+	if err := ProcessPending(ctx, db, "work-b", "/work-b", func(string) (runner.Harness, error) { return other, nil }); err != nil {
+		t.Fatalf("independent Work was blocked: %v", err)
+	}
+	if other.callCount != 1 {
+		t.Fatalf("independent Work Harness calls=%d, want 1", other.callCount)
+	}
+	close(blocked.release)
+	if err := <-blockedResult; err != nil {
+		t.Fatal(err)
 	}
 }

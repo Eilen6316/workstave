@@ -1,5 +1,11 @@
 // Command workstave is the minimal CLI over the store and runner packages.
 //
+//	workstave work create [-id ID] [-harness codex|claude] [-dir DIR] [-db PATH]
+//	workstave conversation create -work ID [-id ID] [-db PATH]
+//	workstave ask -conversation ID [-message ID] -prompt TEXT [-experiment-harness codex|claude] [-db PATH]
+//	workstave history -conversation ID [-db PATH]
+//	workstave state -work ID [-history] [-db PATH]
+//	workstave daemon [-db PATH]
 //	workstave run -harness codex|claude -prompt TEXT [-dir DIR] [-db PATH] [-op ID] [-budget USD]
 //	workstave resume -session ID -harness codex|claude -prompt TEXT [-db PATH] [-op ID] [-budget USD]
 //	workstave pause -work ID [-db PATH]
@@ -27,10 +33,22 @@ func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: workstave run|resume|pause|unpause|recover [flags]")
+		fmt.Fprintln(os.Stderr, "usage: workstave work|conversation|ask|history|state|daemon|run|resume|pause|unpause|recover [flags]")
 		return 2
 	}
 	switch args[0] {
+	case "work":
+		return cmdWork(args[1:])
+	case "conversation":
+		return cmdConversation(args[1:])
+	case "ask":
+		return cmdAsk(args[1:])
+	case "history":
+		return cmdHistory(args[1:])
+	case "state":
+		return cmdWorkState(args[1:])
+	case "daemon":
+		return cmdDaemon(args[1:])
 	case "run":
 		return cmdRun(args[1:])
 	case "resume":
@@ -70,9 +88,9 @@ func openDB(ctx context.Context, path string) (*store.DB, func(), error) {
 	return db, func() { _ = db.Close(); _ = l.Release() }, nil
 }
 
-// openControlDB uses the runtime lock when no owner is active. If a runtime owns the state
-// directory, it opens only the existing current-schema database; the control command performs
-// no migrations and writes only the short pause-state transaction.
+// openControlDB uses the runtime lock when no owner is active. If a Runtime owns the state
+// directory, it opens only the existing current-schema database for short control or acceptance
+// writes, without running migrations.
 func openControlDB(ctx context.Context, path string) (*store.DB, func(), error) {
 	db, closeDB, err := openDB(ctx, path)
 	if err == nil {
@@ -86,6 +104,18 @@ func openControlDB(ctx context.Context, path string) (*store.DB, func(), error) 
 		return nil, nil, err
 	}
 	return db, func() { _ = db.Close() }, nil
+}
+
+// recoverAtOwnerStart runs once after the Runtime has acquired the state-directory lock.
+func recoverAtOwnerStart(ctx context.Context, db *store.DB) (store.Recovery, error) {
+	recovered, err := db.RecoverOnStart(ctx)
+	if err != nil {
+		return store.Recovery{}, err
+	}
+	if err := db.RecoverMailboxOnStart(ctx); err != nil {
+		return store.Recovery{}, err
+	}
+	return recovered, nil
 }
 
 func newID() string {
@@ -105,7 +135,7 @@ func makeHarness(name, budget string) (runner.Harness, error) {
 	switch name {
 	case "codex":
 		return runner.Codex{}, nil
-	case "claude":
+	case "claude", "claude-code":
 		return runner.Claude{MaxBudget: budget}, nil
 	default:
 		return nil, fmt.Errorf("-harness must be codex or claude")
@@ -156,6 +186,10 @@ func cmdRun(args []string) int {
 		return 1
 	}
 	defer closeDB()
+	if _, err := recoverAtOwnerStart(ctx, db); err != nil {
+		fmt.Fprintf(os.Stderr, "workstave run: runtime recovery: %v\n", err)
+		return 1
+	}
 
 	sessionID, runID := "s-"+newID(), "r-"+newID()
 	if err := db.CreateSession(ctx, sessionID, "default", "worker"); err != nil {
@@ -207,6 +241,10 @@ func cmdResume(args []string) int {
 		return 1
 	}
 	defer closeDB()
+	if _, err := recoverAtOwnerStart(ctx, db); err != nil {
+		fmt.Fprintf(os.Stderr, "workstave resume: runtime recovery: %v\n", err)
+		return 1
+	}
 
 	runID := "r-" + newID()
 	out, err := runner.Resume(ctx, db, h, runner.ResumeParams{
@@ -268,7 +306,7 @@ func cmdRecover(args []string) int {
 		return 1
 	}
 	defer closeDB()
-	rec, err := db.RecoverOnStart(ctx)
+	rec, err := recoverAtOwnerStart(ctx, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workstave recover: %v\n", err)
 		return 1

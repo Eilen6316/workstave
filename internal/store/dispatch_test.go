@@ -32,7 +32,17 @@ func outcomeOf(t *testing.T, db *DB, runID string) string {
 
 func seedRun(t *testing.T, db *DB, runID string) int64 {
 	t.Helper()
-	bindingID, _, _, err := db.BeginFirstRun(context.Background(), runID, "s1", "codex", "/x", "", "op-"+runID)
+	return seedRunForSession(t, db, runID, "s1")
+}
+
+func seedRunForSession(t *testing.T, db *DB, runID, sessionID string) int64 {
+	t.Helper()
+	if sessionID != "s1" {
+		if err := db.CreateSession(context.Background(), sessionID, "w1", "worker"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bindingID, _, _, err := db.BeginFirstRun(context.Background(), runID, sessionID, "codex", "/x", "", "op-"+runID, "intent-"+runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +106,30 @@ func TestPauseCommittedBeforeDispatchRejectsAuthorization(t *testing.T) {
 	}
 }
 
+func TestPendingRecoveryDoesNotCarryDispatchAuthorizationAcrossPause(t *testing.T) {
+	db := openWithSession(t)
+	ctx := context.Background()
+	seedRun(t, db, "r-pending-paused")
+	if err := db.SetWorkPaused(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := db.RecoverOnStart(ctx); err != nil || recovered.Pending != 1 || recovered.Unknown != 0 {
+		t.Fatalf("pending recovery=%+v err=%v, want the undispatched run retained", recovered, err)
+	}
+	if err := db.AuthorizeDispatch(ctx, "r-pending-paused"); err == nil {
+		t.Fatal("recovered pending Run gained dispatch authorization while Work was paused")
+	}
+	if got := dispatchOf(t, db, "r-pending-paused"); got != DispatchPending {
+		t.Fatalf("dispatch state while paused=%q, want pending", got)
+	}
+	if err := db.SetWorkPaused(ctx, "w1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AuthorizeDispatch(ctx, "r-pending-paused"); err != nil {
+		t.Fatalf("pending Run could not obtain fresh authorization after unpause: %v", err)
+	}
+}
+
 func TestDispatchAuthorizationCommittedBeforePauseRemainsInFlight(t *testing.T) {
 	db := openWithSession(t)
 	ctx := context.Background()
@@ -144,7 +178,7 @@ func TestRecoverOnStartKeepsPendingAndMarksTheRest(t *testing.T) {
 	ctx := context.Background()
 	bindings := make(map[string]int64)
 	for _, id := range []string{"r-pending", "r-disp", "r-ack", "r-done"} {
-		bindings[id] = seedRun(t, db, id)
+		bindings[id] = seedRunForSession(t, db, id, "s-"+id)
 	}
 	for _, id := range []string{"r-disp", "r-ack", "r-done"} {
 		if err := db.AuthorizeDispatch(ctx, id); err != nil {

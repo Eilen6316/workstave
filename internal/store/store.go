@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS works (
 	id              TEXT PRIMARY KEY,
 	main_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+	main_harness    TEXT NOT NULL DEFAULT 'codex' CHECK (main_harness IN ('codex','claude-code')),
+	working_dir     TEXT NOT NULL DEFAULT '',
 	revision        INTEGER NOT NULL DEFAULT 0,
 	controller_epoch INTEGER NOT NULL DEFAULT 1,
 	created_at      INTEGER NOT NULL
@@ -61,8 +63,12 @@ CREATE TABLE IF NOT EXISTS mailbox (
 	work_id        TEXT NOT NULL REFERENCES works(id),
 	conversation_id TEXT NOT NULL REFERENCES conversations(id),
 	message_id     TEXT NOT NULL UNIQUE REFERENCES messages(id),
+	op_id          TEXT NOT NULL DEFAULT '',
 	harness        TEXT NOT NULL CHECK (harness IN ('claude-code','codex')),
+	harness_experiment INTEGER NOT NULL DEFAULT 0 CHECK (harness_experiment IN (0,1)),
 	state          TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','processing','completed','unknown')),
+	result         TEXT CHECK (result IN ('completed','failed','unknown')),
+	result_detail  TEXT,
 	accepted_at    INTEGER NOT NULL,
 	started_at     INTEGER,
 	finished_at    INTEGER
@@ -86,7 +92,8 @@ CREATE TABLE IF NOT EXISTS runs (
 	op_id      TEXT NOT NULL UNIQUE,
 	started_at INTEGER NOT NULL,
 	ended_at   INTEGER,
-	outcome    TEXT CHECK (outcome IN ('completed','failed','unknown'))
+	outcome    TEXT CHECK (outcome IN ('completed','failed','unknown')),
+	intent_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS main_runs (
 	run_id            TEXT PRIMARY KEY REFERENCES runs(id),
@@ -109,6 +116,7 @@ CREATE TABLE IF NOT EXISTS work_facts (
 	value             TEXT NOT NULL,
 	status            TEXT NOT NULL CHECK (status IN ('confirmed','candidate','superseded')),
 	source_message_id TEXT NOT NULL REFERENCES messages(id),
+	confirmation_basis TEXT NOT NULL DEFAULT 'legacy',
 	created_at        INTEGER NOT NULL,
 	PRIMARY KEY (work_id, kind, fact_key, revision)
 );
@@ -123,7 +131,7 @@ type DB struct {
 // schemaVersion is stored in PRAGMA user_version. Open refuses a database whose version is
 // newer than this, so an older binary never writes into a schema it does not understand.
 // Databases created before versioning have user_version 0 and are stamped on first open.
-const schemaVersion = 4
+const schemaVersion = 6
 
 // Open opens or creates the database at path and applies the schema. Every connection runs
 // with synchronous=FULL so a committed record survives a power loss, not only a process crash.
@@ -149,6 +157,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := migrateIdentityAndResults(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: stamp schema version: %w", err)
@@ -156,8 +168,9 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	return &DB{sql: db}, nil
 }
 
-// OpenControl opens an existing, current-schema database for a short control operation while
-// the runtime owner holds the state-directory lock. It performs no schema changes.
+// OpenControl opens an existing current-schema database for a short control or message
+// acceptance transaction while the Runtime owner holds the state-directory lock. It performs no
+// schema changes.
 func OpenControl(ctx context.Context, path string) (*DB, error) {
 	dsn := "file:" + path + "?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)

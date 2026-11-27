@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"workstave/internal/outcome"
@@ -20,15 +22,18 @@ func TestWorkConversationsMailboxAndMainRunAssociations(t *testing.T) {
 		}
 	}
 
-	a, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "codex", "Confirmed requirement inventory_format: weekly report is TSV.", []FactProposal{{Kind: "requirement", Key: "inventory_format", Value: "weekly report is TSV", Status: "confirmed"}})
+	a, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Confirmed requirement inventory_format: weekly report is TSV.", []FactProposal{{Kind: "requirement", Key: "inventory_format", Value: "weekly report is TSV", Status: "confirmed"}})
 	if err != nil || a.Sequence != 1 || a.State != "pending" {
 		t.Fatalf("Conversation A acceptance = %+v err=%v", a, err)
 	}
-	if repeated, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "codex", "Confirmed requirement inventory_format: weekly report is TSV.", []FactProposal{{Kind: "requirement", Key: "inventory_format", Value: "weekly report is TSV", Status: "confirmed"}}); err != nil || repeated.Sequence != a.Sequence {
+	if repeated, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Confirmed requirement inventory_format: weekly report is TSV.", []FactProposal{{Kind: "requirement", Key: "inventory_format", Value: "weekly report is TSV", Status: "confirmed"}}); err != nil || repeated.Sequence != a.Sequence {
 		t.Fatalf("repeat acceptance = %+v err=%v, want the original Mailbox identity", repeated, err)
 	}
-	if _, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "codex", "different input", nil); err == nil {
+	if _, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "different input", nil); err == nil {
 		t.Fatal("same message id with different input was accepted")
+	}
+	if _, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Confirmed requirement inventory_format: weekly report is TSV.", []FactProposal{{Kind: "requirement", Key: "inventory_format", Value: "PDF", Status: "confirmed"}}); err == nil {
+		t.Fatal("same message identity with a different state proposal was accepted")
 	}
 	claimedA, found, err := db.ClaimNextMailbox(ctx, "w1")
 	if err != nil || !found || claimedA.MessageID != "msg-a1" || claimedA.State != "processing" {
@@ -42,7 +47,7 @@ func TestWorkConversationsMailboxAndMainRunAssociations(t *testing.T) {
 	bindingID, err := db.BeginMainRun(ctx, MainRunStart{
 		RunID: "run-a1", OpID: "main-msg-a1", WorkID: "w1", MainSessionID: "main-w1",
 		ConversationID: "conv-a", MailboxSequence: claimedA.Sequence, SourceMessageID: "msg-a1",
-		Harness: "codex", WorkingDir: "/work", NativeID: "thread-a", InputSnapshot: `{"revision":1}`, ContextRevision: contextA.Revision,
+		Harness: "codex", WorkingDir: "/work", NativeID: "thread-a", IntentHash: "intent-a1", InputSnapshot: `{"revision":1}`, ContextRevision: contextA.Revision,
 	})
 	if err != nil || bindingID == 0 {
 		t.Fatalf("begin Main Run A binding=%d err=%v", bindingID, err)
@@ -50,7 +55,7 @@ func TestWorkConversationsMailboxAndMainRunAssociations(t *testing.T) {
 	if state, err := db.DispatchState(ctx, "run-a1"); err != nil || state != DispatchDispatching {
 		t.Fatalf("Main Run dispatch=%q err=%v, want dispatching authorization", state, err)
 	}
-	if err := db.CompleteMainRun(ctx, "run-a1", "reply-a1", "Requirement recorded.", outcome.Completed); err != nil {
+	if err := db.CompleteMainRun(ctx, "run-a1", MainCompletion{ReplyID: "reply-a1", Reply: "Requirement recorded.", Result: "completed"}, outcome.Completed); err != nil {
 		t.Fatal(err)
 	}
 	mainRun, ok, err := db.MainRunForMessage(ctx, "msg-a1")
@@ -65,7 +70,7 @@ func TestWorkConversationsMailboxAndMainRunAssociations(t *testing.T) {
 		t.Fatalf("Mailbox A=%+v err=%v", item, err)
 	}
 
-	b, err := db.AcceptUserMessage(ctx, "msg-b1", "conv-b", "codex", "What format was agreed?", nil)
+	b, err := db.AcceptUserMessage(ctx, "msg-b1", "conv-b", "What format was agreed?", nil)
 	if err != nil || b.Sequence <= a.Sequence {
 		t.Fatalf("Conversation B acceptance=%+v err=%v", b, err)
 	}
@@ -82,6 +87,37 @@ func TestWorkConversationsMailboxAndMainRunAssociations(t *testing.T) {
 	}
 }
 
+func TestAcceptanceAssignsStableKernelOperationIdentity(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	if err := db.CreateWork(ctx, "w1", "main-w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.AcceptUserMessage(ctx, "request-1", "conv-a", "Summarize the current state.", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := reflect.TypeOf(first).FieldByName("OpID")
+	if !ok || field.Type.Kind() != reflect.String {
+		t.Fatal("accepted Mailbox item does not expose the Kernel-assigned operation identity")
+	}
+	opID := reflect.ValueOf(first).FieldByIndex(field.Index).String()
+	if opID == "" || opID == "main-"+first.MessageID {
+		t.Fatalf("operation identity %q was absent or derived from the Message ID", opID)
+	}
+	retry, err := db.AcceptUserMessage(ctx, "request-1", "conv-a", "Summarize the current state.", nil)
+	retryOpID := reflect.ValueOf(retry).FieldByName("OpID")
+	if err != nil || retry.MessageID != first.MessageID || !retryOpID.IsValid() || retryOpID.String() != opID {
+		t.Fatalf("retry acceptance = %+v err=%v, want stable Message and operation identities", retry, err)
+	}
+	if _, err := db.AcceptUserMessage(ctx, "request-1", "conv-a", "Use a different intent.", nil); err == nil {
+		t.Fatal("same request identity with a different intent was accepted")
+	}
+}
+
 func TestCandidateDoesNotSupersedeConfirmedWorkFact(t *testing.T) {
 	ctx := context.Background()
 	db := openTemp(t)
@@ -91,16 +127,24 @@ func TestCandidateDoesNotSupersedeConfirmedWorkFact(t *testing.T) {
 	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptUserMessage(ctx, "msg-confirmed", "conv-a", "codex", "Confirmed decision format: use TSV.", []FactProposal{{Kind: "decision", Key: "format", Value: "use TSV", Status: "confirmed"}}); err != nil {
+	confirmedMessage, err := db.AcceptUserMessage(ctx, "msg-confirmed", "conv-a", "Confirmed decision format: use TSV.", []FactProposal{{Kind: "decision", Key: "format", Value: "use TSV", Status: "confirmed"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.ClaimNextMailbox(ctx, "w1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AcceptUserMessage(ctx, "msg-candidate", "conv-a", "codex", "Candidate decision format: PDF might be easier.", []FactProposal{{Kind: "decision", Key: "format", Value: "PDF might be easier", Status: "candidate"}}); err != nil {
+	if err := exec(t, db, `UPDATE mailbox SET state='completed' WHERE sequence=?`, confirmedMessage.Sequence); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := db.AcceptUserMessage(ctx, "msg-candidate", "conv-a", "Candidate decision format: PDF might be easier.", []FactProposal{{Kind: "decision", Key: "format", Value: "PDF might be easier", Status: "candidate"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.ClaimNextMailbox(ctx, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec(t, db, `UPDATE mailbox SET state='completed' WHERE sequence=?`, candidate.Sequence); err != nil {
 		t.Fatal(err)
 	}
 	confirmed, err := db.sql.QueryContext(ctx, `SELECT value FROM work_facts WHERE work_id='w1' AND kind='decision' AND fact_key='format' AND status='confirmed'`)
@@ -130,7 +174,7 @@ func TestRecoverMailboxDoesNotReplayCommittedMainRun(t *testing.T) {
 	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
 		t.Fatal(err)
 	}
-	item, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "codex", "Check status.", nil)
+	item, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Check status.", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +182,7 @@ func TestRecoverMailboxDoesNotReplayCommittedMainRun(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("claim found=%v err=%v", found, err)
 	}
-	if _, err := db.BeginMainRun(ctx, MainRunStart{RunID: "run-a1", OpID: "main-msg-a1", WorkID: "w1", MainSessionID: "main-w1", ConversationID: "conv-a", MailboxSequence: item.Sequence, SourceMessageID: "msg-a1", Harness: "codex", WorkingDir: "/work", InputSnapshot: `{}`}); err != nil {
+	if _, err := db.BeginMainRun(ctx, MainRunStart{RunID: "run-a1", OpID: "main-msg-a1", WorkID: "w1", MainSessionID: "main-w1", ConversationID: "conv-a", MailboxSequence: item.Sequence, SourceMessageID: "msg-a1", Harness: "codex", WorkingDir: "/work", IntentHash: "intent-main", InputSnapshot: `{}`}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.RecoverMailboxOnStart(ctx); err != nil {
@@ -162,7 +206,7 @@ func TestRetryingClaimDoesNotApplyFactProposalTwice(t *testing.T) {
 	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
 		t.Fatal(err)
 	}
-	item, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "codex", "Confirmed decision format: use TSV.", []FactProposal{{Kind: "decision", Key: "format", Value: "use TSV", Status: "confirmed"}})
+	item, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Confirmed decision format: use TSV.", []FactProposal{{Kind: "decision", Key: "format", Value: "use TSV", Status: "confirmed"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,5 +226,101 @@ func TestRetryingClaimDoesNotApplyFactProposalTwice(t *testing.T) {
 	w, err := db.Work(ctx, "w1")
 	if err != nil || w.Revision != 1 {
 		t.Fatalf("Work revision=%d err=%v, want 1", w.Revision, err)
+	}
+}
+
+func TestOwnerStartupRestoresUnstartedInputToPendingWithoutReapplyingFact(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	if err := db.CreateWork(ctx, "w1", "main-w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := db.AcceptUserMessage(ctx, "msg-a1", "conv-a", "Confirmed requirement auth_method: use JWT.", []FactProposal{{Kind: "requirement", Key: "auth_method", Value: "use JWT", Status: "confirmed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := db.ClaimNextMailbox(ctx, "w1"); err != nil || !found {
+		t.Fatalf("claim found=%v err=%v", found, err)
+	}
+	if err := db.RecoverMailboxOnStart(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := db.MailboxByMessage(ctx, "msg-a1")
+	if err != nil || mailbox.State != "pending" {
+		t.Fatalf("unstarted Mailbox recovery=%+v err=%v", mailbox, err)
+	}
+	if _, found, err := db.ClaimNextMailbox(ctx, "w1"); err != nil || !found {
+		t.Fatalf("reclaimed message found=%v err=%v", found, err)
+	}
+	history, err := db.WorkFactHistory(ctx, "w1", "requirement", "auth_method")
+	if err != nil || len(history) != 1 || history[0].Revision != 1 || item.Sequence != mailbox.Sequence {
+		t.Fatalf("fact history after recovery=%+v err=%v", history, err)
+	}
+}
+
+func TestConcurrentMailboxClaimsHaveOneOrderedOwner(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	if err := db.CreateWork(ctx, "w1", "main-w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conv-a", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.AcceptUserMessage(ctx, "msg-1", "conv-a", "first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptUserMessage(ctx, "msg-2", "conv-a", "second", nil); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan struct {
+		item  MailboxItem
+		found bool
+		err   error
+	}, 2)
+	var ready sync.WaitGroup
+	for range 2 {
+		ready.Add(1)
+		go func() {
+			ready.Done()
+			<-start
+			item, found, err := db.ClaimNextMailbox(ctx, "w1")
+			results <- struct {
+				item  MailboxItem
+				found bool
+				err   error
+			}{item, found, err}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	claimed := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent claim returned an error: %v", result.err)
+		}
+		if result.found {
+			claimed++
+			if result.item.Sequence != first.Sequence || result.item.MessageID != "msg-1" {
+				t.Fatalf("claimed out of order: %+v, want first Mailbox item", result.item)
+			}
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("simultaneous consumers claimed %d items, want one owner", claimed)
+	}
+	firstState, err := db.MailboxByMessage(ctx, "msg-1")
+	if err != nil || firstState.State != "processing" {
+		t.Fatalf("first Mailbox state=%+v err=%v", firstState, err)
+	}
+	secondState, err := db.MailboxByMessage(ctx, "msg-2")
+	if err != nil || secondState.State != "pending" {
+		t.Fatalf("second Mailbox state=%+v err=%v", secondState, err)
 	}
 }

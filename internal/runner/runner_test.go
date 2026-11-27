@@ -163,6 +163,57 @@ func TestPausedWorkDoesNotLaunchHarness(t *testing.T) {
 	}
 }
 
+func TestLegacyCreateAndResumeCannotBypassUnresolvedMainRun(t *testing.T) {
+	for _, action := range []string{"create", "resume"} {
+		t.Run(action, func(t *testing.T) {
+			db := open(t)
+			ctx := context.Background()
+			if err := db.CreateWork(ctx, "w1", "main-1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.CreateConversation(ctx, "conv-1", "w1"); err != nil {
+				t.Fatal(err)
+			}
+			item, err := db.AcceptUserMessage(ctx, "message-main", "conv-1", "first main input", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item, found, err := db.ClaimNextMailbox(ctx, "w1")
+			if err != nil || !found {
+				t.Fatalf("claim found=%v err=%v", found, err)
+			}
+			if _, err := db.BeginMainRun(ctx, store.MainRunStart{
+				RunID: "main-run", OpID: "main-op", WorkID: "w1", MainSessionID: "main-1",
+				ConversationID: "conv-1", MailboxSequence: item.Sequence, SourceMessageID: item.MessageID,
+				Harness: "codex", WorkingDir: "/work", NativeID: "thread-main", IntentHash: "main-intent", InputSnapshot: `{}`,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			h := &fake{name: "codex", preID: "thread-new", ackID: "thread-main", out: outcome.Completed}
+			var runErr error
+			if action == "create" {
+				_, runErr = Create(ctx, db, h, Params{SessionID: "main-1", RunID: "legacy-create", OpID: "legacy-create-op", Dir: "/work", Prompt: "bypass"})
+			} else {
+				_, runErr = Resume(ctx, db, h, ResumeParams{SessionID: "main-1", RunID: "legacy-resume", OpID: "legacy-resume-op", Prompt: "bypass"})
+			}
+			if runErr == nil || h.calls != 0 {
+				t.Fatalf("legacy %s err=%v launched=%d, want rejection before Harness", action, runErr, h.calls)
+			}
+			binding, err := db.ActiveBinding(ctx, "main-1")
+			if err != nil || binding.NativeID != "thread-main" {
+				t.Fatalf("Main binding after rejected %s = %+v err=%v", action, binding, err)
+			}
+			worker, err := Create(ctx, db, &fake{name: "codex", ackID: "worker-thread", out: outcome.Completed}, Params{
+				SessionID: "s1", RunID: "unrelated-worker-run", OpID: "unrelated-worker-op", Dir: "/work", Prompt: "independent work",
+			})
+			if err != nil || worker != outcome.Completed {
+				t.Fatalf("unrelated Worker was blocked by Main Run: outcome=%q err=%v", worker, err)
+			}
+		})
+	}
+}
+
 func TestResumeUsesSavedBindingAndCreatesANewRun(t *testing.T) {
 	db := open(t)
 	ctx := context.Background()
@@ -299,6 +350,32 @@ func TestRepeatedOpIsNotLaunchedAgain(t *testing.T) {
 	}
 	if f.calls != 1 {
 		t.Fatalf("harness launched %d times, want 1", f.calls)
+	}
+}
+
+func TestPendingRunCanBeAuthorizedAfterRestartWithSameIntent(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	request := params
+	request.RunID = "r-retry"
+	intent, err := intentFingerprint("create", request.SessionID, "codex", request.Dir, request.Prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, created, err := db.BeginFirstRun(ctx, "r-pending", request.SessionID, "codex", request.Dir, "", request.OpID, intent); err != nil || !created {
+		t.Fatalf("persist pending intent created=%v err=%v", created, err)
+	}
+	if rec, err := db.RecoverOnStart(ctx); err != nil || rec.Pending != 1 || rec.Unknown != 0 {
+		t.Fatalf("pending recovery=%+v err=%v", rec, err)
+	}
+	h := &fake{name: "codex", ackID: "thread-pending", out: outcome.Completed}
+	result, err := CreateWithOutput(ctx, db, h, request)
+	if err != nil || result.Outcome != outcome.Completed || h.calls != 1 {
+		t.Fatalf("pending operation outcome=%q err=%v calls=%d", result.Outcome, err, h.calls)
+	}
+	stored, found, err := db.RunForOp(ctx, request.OpID)
+	if err != nil || !found || stored.ID != "r-pending" || stored.Outcome.String != string(outcome.Completed) {
+		t.Fatalf("recovered Run=%+v found=%v err=%v", stored, found, err)
 	}
 }
 

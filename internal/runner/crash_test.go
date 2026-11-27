@@ -64,7 +64,7 @@ func TestHelperCrashAfterPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, created, err := db.BeginFirstRun(ctx, "r-pending", "s1", "codex", "/x", "", "op-pending"); err != nil || !created {
+	if _, _, created, err := db.BeginFirstRun(ctx, "r-pending", "s1", "codex", "/x", "", "op-pending", "intent-pending"); err != nil || !created {
 		t.Fatalf("create pending run: created=%v err=%v", created, err)
 	}
 	os.Exit(5) // after the run commit, before dispatch authorization

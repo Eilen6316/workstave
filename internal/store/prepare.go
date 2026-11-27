@@ -26,10 +26,12 @@ func bindTx(ctx context.Context, tx *sql.Tx, sessionID, harness, cwd, nativeID s
 
 // BeginFirstRun makes the binding (with the pre-assigned native id, if any) and the run in one
 // transaction, so a crash can never leave a binding without its run or the reverse. It must be
-// committed before any external process is started. The op_id is the stable operation
-// identity: if it already has a run, nothing is written and that run is returned with
-// created=false. An op_id that belongs to a different session is rejected.
-func (d *DB) BeginFirstRun(ctx context.Context, runID, sessionID, harness, cwd, nativeID, opID string) (int64, Run, bool, error) {
+// committed before any external process is started. A repeated operation identity returns the
+// existing Run only when its intent hash matches. Main Sessions use BeginMainRun instead.
+func (d *DB) BeginFirstRun(ctx context.Context, runID, sessionID, harness, cwd, nativeID, opID, intentHash string) (int64, Run, bool, error) {
+	if runID == "" || sessionID == "" || harness == "" || opID == "" || intentHash == "" {
+		return 0, Run{}, false, fmt.Errorf("store: run, session, harness, operation identity and intent are required")
+	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, Run{}, false, fmt.Errorf("store: begin first run: %w", err)
@@ -37,16 +39,28 @@ func (d *DB) BeginFirstRun(ctx context.Context, runID, sessionID, harness, cwd, 
 	defer func() { _ = tx.Rollback() }()
 
 	var existing Run
-	err = tx.QueryRowContext(ctx, `SELECT id, session_id, binding_id, op_id, started_at, ended_at, outcome FROM runs WHERE op_id = ?`, opID).
-		Scan(&existing.ID, &existing.SessionID, &existing.BindingID, &existing.OpID, &existing.StartedAt, &existing.EndedAt, &existing.Outcome)
+	err = tx.QueryRowContext(ctx, `SELECT id, session_id, binding_id, op_id, intent_hash, dispatch, started_at, ended_at, outcome
+		FROM runs WHERE op_id = ?`, opID).
+		Scan(&existing.ID, &existing.SessionID, &existing.BindingID, &existing.OpID, &existing.IntentHash, &existing.Dispatch,
+			&existing.StartedAt, &existing.EndedAt, &existing.Outcome)
 	switch {
 	case err == nil:
-		if existing.SessionID != sessionID {
-			return 0, Run{}, false, fmt.Errorf("store: op %q already belongs to run %q for a different session", opID, existing.ID)
+		if existing.SessionID != sessionID || existing.IntentHash != intentHash {
+			return 0, Run{}, false, fmt.Errorf("store: op %q already belongs to run %q for a different session or intent", opID, existing.ID)
 		}
 		return existing.BindingID.Int64, existing, false, nil
 	case !errors.Is(err, sql.ErrNoRows):
 		return 0, Run{}, false, fmt.Errorf("store: look up op %q: %w", opID, err)
+	}
+	var role string
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM sessions WHERE id = ?`, sessionID).Scan(&role); err != nil {
+		return 0, Run{}, false, fmt.Errorf("store: session %q: %w", sessionID, err)
+	}
+	if role != "worker" {
+		return 0, Run{}, false, fmt.Errorf("store: direct Run creation is not allowed for Main session %q", sessionID)
+	}
+	if err := ensureNoUnresolvedRunTx(ctx, tx, sessionID, ""); err != nil {
+		return 0, Run{}, false, err
 	}
 
 	bindingID, err := bindTx(ctx, tx, sessionID, harness, cwd, nativeID)
@@ -54,11 +68,12 @@ func (d *DB) BeginFirstRun(ctx context.Context, runID, sessionID, harness, cwd, 
 		return 0, Run{}, false, err
 	}
 	started := nowMS()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, session_id, binding_id, op_id, started_at) VALUES (?,?,?,?,?)`, runID, sessionID, bindingID, opID, started); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(id, session_id, binding_id, op_id, started_at, intent_hash)
+		VALUES (?,?,?,?,?,?)`, runID, sessionID, bindingID, opID, started, intentHash); err != nil {
 		return 0, Run{}, false, fmt.Errorf("store: insert run %q: %w", runID, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, Run{}, false, fmt.Errorf("store: commit first run: %w", err)
 	}
-	return bindingID, Run{ID: runID, SessionID: sessionID, BindingID: sql.NullInt64{Int64: bindingID, Valid: true}, OpID: opID, StartedAt: started}, true, nil
+	return bindingID, Run{ID: runID, SessionID: sessionID, BindingID: sql.NullInt64{Int64: bindingID, Valid: true}, OpID: opID, IntentHash: intentHash, Dispatch: DispatchPending, StartedAt: started}, true, nil
 }
