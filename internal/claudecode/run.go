@@ -20,6 +20,7 @@ type Event struct {
 	Subtype   string          `json:"subtype"`
 	IsError   bool            `json:"is_error"`
 	SessionID string          `json:"session_id"`
+	Result    string          `json:"result"`
 	Raw       json.RawMessage `json:"-"`
 }
 

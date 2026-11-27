@@ -20,19 +20,19 @@ type crashing struct{}
 
 func (crashing) Name() string        { return "codex" }
 func (crashing) NewNativeID() string { return "" }
-func (crashing) Execute(context.Context, Request, func(string)) (outcome.Outcome, error) {
+func (crashing) Execute(context.Context, Request, func(string)) (Execution, error) {
 	os.Exit(3) // no deferred close, no outcome recorded
-	return "", nil
+	return Execution{}, nil
 }
 
 type crashingAfterAck struct{}
 
 func (crashingAfterAck) Name() string        { return "codex" }
 func (crashingAfterAck) NewNativeID() string { return "" }
-func (crashingAfterAck) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (crashingAfterAck) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (Execution, error) {
 	onAcknowledged("thread-crash")
 	os.Exit(4) // the acknowledgement is committed, but the run outcome is not
-	return "", nil
+	return Execution{}, nil
 }
 
 // TestHelperCrashAfterDispatching is the crashing process. It does nothing unless the parent

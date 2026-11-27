@@ -17,6 +17,7 @@ type fake struct {
 	name, preID, ackID string
 	lastReq            Request
 	out                outcome.Outcome
+	text               string
 	err                error
 	during             func()
 	calls              int
@@ -24,7 +25,7 @@ type fake struct {
 
 func (f *fake) Name() string        { return f.name }
 func (f *fake) NewNativeID() string { return f.preID }
-func (f *fake) Execute(_ context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (f *fake) Execute(_ context.Context, req Request, onAcknowledged func(string)) (Execution, error) {
 	f.calls++
 	f.lastReq = req
 	if f.during != nil {
@@ -33,7 +34,7 @@ func (f *fake) Execute(_ context.Context, req Request, onAcknowledged func(strin
 	if f.ackID != "" {
 		onAcknowledged(f.ackID)
 	}
-	return f.out, f.err
+	return Execution{Outcome: f.out, Text: f.text}, f.err
 }
 
 var params = Params{SessionID: "s1", RunID: "r1", OpID: "op1", Dir: "/x", Prompt: "p"}

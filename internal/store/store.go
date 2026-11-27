@@ -1,5 +1,5 @@
-// Package store persists the minimal P0-A records: logical sessions, per-work dispatch pause,
-// native bindings and runs.
+// Package store persists Work state, Conversations, Mailbox messages, Main Runs, logical
+// sessions, per-work dispatch pause, native bindings and Runs.
 // It holds data only; it makes no scheduling or recovery decisions.
 package store
 
@@ -22,10 +22,52 @@ CREATE TABLE IF NOT EXISTS sessions (
 	role       TEXT NOT NULL CHECK (role IN ('main','worker')),
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS works (
+	id              TEXT PRIMARY KEY,
+	main_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+	revision        INTEGER NOT NULL DEFAULT 0,
+	controller_epoch INTEGER NOT NULL DEFAULT 1,
+	created_at      INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS work_pause (
 	work_id TEXT PRIMARY KEY,
 	paused  INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1))
 );
+CREATE TABLE IF NOT EXISTS conversations (
+	id         TEXT PRIMARY KEY,
+	work_id    TEXT NOT NULL REFERENCES works(id),
+	created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+	id              TEXT PRIMARY KEY,
+	work_id         TEXT NOT NULL REFERENCES works(id),
+	conversation_id TEXT NOT NULL REFERENCES conversations(id),
+	role            TEXT NOT NULL CHECK (role IN ('user','assistant')),
+	body            TEXT NOT NULL,
+	reply_to        TEXT REFERENCES messages(id),
+	created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages(conversation_id, created_at, id);
+CREATE TABLE IF NOT EXISTS message_fact_proposals (
+	message_id TEXT NOT NULL REFERENCES messages(id),
+	kind       TEXT NOT NULL CHECK (kind IN ('requirement','decision')),
+	fact_key   TEXT NOT NULL,
+	value      TEXT NOT NULL,
+	status     TEXT NOT NULL CHECK (status IN ('confirmed','candidate')),
+	PRIMARY KEY (message_id, kind, fact_key)
+);
+CREATE TABLE IF NOT EXISTS mailbox (
+	sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+	work_id        TEXT NOT NULL REFERENCES works(id),
+	conversation_id TEXT NOT NULL REFERENCES conversations(id),
+	message_id     TEXT NOT NULL UNIQUE REFERENCES messages(id),
+	harness        TEXT NOT NULL CHECK (harness IN ('claude-code','codex')),
+	state          TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','processing','completed','unknown')),
+	accepted_at    INTEGER NOT NULL,
+	started_at     INTEGER,
+	finished_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS pending_mailbox_by_work ON mailbox(work_id, state, sequence);
 CREATE TABLE IF NOT EXISTS native_bindings (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
 	session_id  TEXT NOT NULL REFERENCES sessions(id),
@@ -46,6 +88,31 @@ CREATE TABLE IF NOT EXISTS runs (
 	ended_at   INTEGER,
 	outcome    TEXT CHECK (outcome IN ('completed','failed','unknown'))
 );
+CREATE TABLE IF NOT EXISTS main_runs (
+	run_id            TEXT PRIMARY KEY REFERENCES runs(id),
+	work_id           TEXT NOT NULL REFERENCES works(id),
+	conversation_id   TEXT NOT NULL REFERENCES conversations(id),
+	mailbox_sequence  INTEGER NOT NULL UNIQUE REFERENCES mailbox(sequence),
+	source_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+	input_snapshot    TEXT NOT NULL,
+	context_revision  INTEGER NOT NULL,
+	controller_epoch  INTEGER NOT NULL,
+	output_message_id TEXT REFERENCES messages(id),
+	started_at        INTEGER NOT NULL,
+	ended_at          INTEGER
+);
+CREATE TABLE IF NOT EXISTS work_facts (
+	work_id           TEXT NOT NULL REFERENCES works(id),
+	kind              TEXT NOT NULL CHECK (kind IN ('requirement','decision')),
+	fact_key          TEXT NOT NULL,
+	revision          INTEGER NOT NULL,
+	value             TEXT NOT NULL,
+	status            TEXT NOT NULL CHECK (status IN ('confirmed','candidate','superseded')),
+	source_message_id TEXT NOT NULL REFERENCES messages(id),
+	created_at        INTEGER NOT NULL,
+	PRIMARY KEY (work_id, kind, fact_key, revision)
+);
+CREATE INDEX IF NOT EXISTS current_work_facts ON work_facts(work_id, status, kind, fact_key, revision);
 `
 
 // DB is an open store.
@@ -56,7 +123,7 @@ type DB struct {
 // schemaVersion is stored in PRAGMA user_version. Open refuses a database whose version is
 // newer than this, so an older binary never writes into a schema it does not understand.
 // Databases created before versioning have user_version 0 and are stamped on first open.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Open opens or creates the database at path and applies the schema. Every connection runs
 // with synchronous=FULL so a committed record survives a power loss, not only a process crash.

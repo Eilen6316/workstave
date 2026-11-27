@@ -7,7 +7,6 @@ import (
 
 	"workstave/internal/claudecode"
 	"workstave/internal/codex"
-	"workstave/internal/outcome"
 )
 
 // Claude adapts the Claude Code driver. It pre-assigns the session id before launch.
@@ -26,7 +25,7 @@ func (Claude) NewNativeID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (Execution, error) {
 	res, err := claudecode.Run(ctx, claudecode.Options{
 		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt, MaxBudget: c.MaxBudget, Model: c.Model,
 		OnEvent: func(ev claudecode.Event) {
@@ -35,7 +34,13 @@ func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(st
 			}
 		},
 	})
-	return res.Outcome(), err
+	var text string
+	for _, ev := range res.Events {
+		if ev.Type == "result" {
+			text = ev.Result
+		}
+	}
+	return Execution{Outcome: res.Outcome(), Text: text}, err
 }
 
 // Codex adapts the Codex exec driver. Codex reports its thread id only after creation.
@@ -48,7 +53,7 @@ func (Codex) Name() string { return "codex" }
 
 func (Codex) NewNativeID() string { return "" }
 
-func (c Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (c Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (Execution, error) {
 	threadID := ""
 	if req.Resume {
 		threadID = req.NativeID
@@ -65,5 +70,11 @@ func (c Codex) Execute(ctx context.Context, req Request, onAcknowledged func(str
 			}
 		},
 	})
-	return res.Outcome(), err
+	var text string
+	for _, ev := range res.Events {
+		if (ev.ItemType == "agentMessage" || ev.ItemType == "agent_message") && ev.Text != "" {
+			text = ev.Text
+		}
+	}
+	return Execution{Outcome: res.Outcome(), Text: text}, err
 }
