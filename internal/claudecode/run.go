@@ -29,6 +29,7 @@ type Options struct {
 	Dir       string // working directory; also decides where the session file is persisted
 	SessionID string // UUID assigned by the caller before launch
 	Resume    bool   // resume SessionID instead of creating it
+	Model     string // optional model override for this invocation
 	Prompt    string // sent on stdin
 	MaxBudget string // USD cap, e.g. "0.05"
 	// Tools is the built-in tool set passed to --tools; empty means none.
@@ -57,6 +58,9 @@ func buildArgs(o Options) []string {
 	}
 	if o.MaxBudget != "" {
 		a = append(a, "--max-budget-usd", o.MaxBudget)
+	}
+	if o.Model != "" {
+		a = append(a, "--model", o.Model)
 	}
 	if o.Resume {
 		return append(a, "--resume", o.SessionID)

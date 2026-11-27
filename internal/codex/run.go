@@ -30,6 +30,7 @@ type Options struct {
 	Bin      string // executable; defaults to "codex"
 	Dir      string // working root passed via -C and used as the process directory
 	ThreadID string // when set, resume this thread instead of creating one
+	Model    string // optional model override for this invocation
 	Prompt   string // sent on stdin
 	Sandbox  string // defaults to read-only
 	// OnEvent, if set, is called synchronously for each parsed event, in order.
@@ -64,9 +65,18 @@ func buildArgs(o Options) []string {
 	// `codex exec resume` accepts neither -s nor -C (verified against the real CLI), so a
 	// resumed turn cannot be given a new sandbox or root; the process directory carries cwd.
 	if o.ThreadID != "" {
-		return []string{"exec", "resume", o.ThreadID, "--json", "--skip-git-repo-check", o.Prompt}
+		a := []string{"exec", "resume", o.ThreadID, "--json", "--skip-git-repo-check"}
+		if o.Model != "" {
+			a = append(a, "--model", o.Model)
+		}
+		return append(a, o.Prompt)
 	}
-	return []string{"exec", "--json", "--skip-git-repo-check", "-s", sandbox, "-C", o.Dir, o.Prompt}
+	a := []string{"exec", "--json", "--skip-git-repo-check"}
+	if o.Model != "" {
+		a = append(a, "--model", o.Model)
+	}
+	a = append(a, "-s", sandbox, "-C", o.Dir, o.Prompt)
+	return a
 }
 
 // Run starts codex, reads every event until stdout closes, and waits for the process.

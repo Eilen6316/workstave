@@ -13,6 +13,7 @@ import (
 // Claude adapts the Claude Code driver. It pre-assigns the session id before launch.
 type Claude struct {
 	MaxBudget string
+	Model     string
 }
 
 func (Claude) Name() string { return "claude-code" }
@@ -27,7 +28,7 @@ func (Claude) NewNativeID() string {
 
 func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	res, err := claudecode.Run(ctx, claudecode.Options{
-		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt, MaxBudget: c.MaxBudget,
+		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt, MaxBudget: c.MaxBudget, Model: c.Model,
 		OnEvent: func(ev claudecode.Event) {
 			if ev.Type == "system" && ev.Subtype == "init" {
 				onAcknowledged(ev.SessionID)
@@ -38,13 +39,15 @@ func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(st
 }
 
 // Codex adapts the Codex exec driver. Codex reports its thread id only after creation.
-type Codex struct{}
+type Codex struct {
+	Model string
+}
 
 func (Codex) Name() string { return "codex" }
 
 func (Codex) NewNativeID() string { return "" }
 
-func (Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
+func (c Codex) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (outcome.Outcome, error) {
 	threadID := ""
 	if req.Resume {
 		threadID = req.NativeID
@@ -52,6 +55,7 @@ func (Codex) Execute(ctx context.Context, req Request, onAcknowledged func(strin
 	res, err := codex.Run(ctx, codex.Options{
 		Dir:      req.Dir,
 		ThreadID: threadID,
+		Model:    c.Model,
 		Prompt:   req.Prompt,
 		OnEvent: func(ev codex.Event) {
 			if ev.Type == "thread.started" {
