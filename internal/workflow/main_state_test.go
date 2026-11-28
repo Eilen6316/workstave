@@ -37,6 +37,42 @@ func TestInvalidStructuredMainResponseIsConsumedAsVisibleFailure(t *testing.T) {
 	}
 }
 
+func TestFailedHarnessRunKeepsItsFailureInsteadOfInvalidResponse(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conversation-a", "work-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Accept(ctx, db, "message-a", "conversation-a", "Please record the authentication requirement."); err != nil {
+		t.Fatal(err)
+	}
+	harness := &fakeHarness{name: "codex", ackID: "thread-a", result: runner.Execution{Outcome: outcome.Failed}}
+	if err := ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil }); err == nil {
+		t.Fatal("failed Harness run was not reported")
+	}
+	mailbox, err := db.MailboxByMessage(ctx, "message-a")
+	if err != nil || mailbox.Result != "failed" || mailbox.ResultDetail != "harness_run_failed" {
+		t.Fatalf("failed run conclusion=%+v err=%v, want harness_run_failed", mailbox, err)
+	}
+	mainRun, found, err := db.MainRunForMessage(ctx, "message-a")
+	if err != nil || !found || mainRun.Outcome.String != string(outcome.Failed) || mainRun.OutputMessageID != "" {
+		t.Fatalf("Main Run for failed Harness=%+v found=%v err=%v", mainRun, found, err)
+	}
+	if facts, err := db.WorkFacts(ctx, "work-1"); err != nil || len(facts) != 0 {
+		t.Fatalf("failed run changed Work State: facts=%+v err=%v", facts, err)
+	}
+}
+
+func TestDecodeMainReplyAcceptsObservedJSONCodeFence(t *testing.T) {
+	completion, err := decodeMainReply("```json\n{\"reply\":\"Recorded.\",\"changes\":[]}\n```")
+	if err != nil || completion.Reply != "Recorded." || completion.Changes == nil || len(completion.Changes) != 0 {
+		t.Fatalf("decoded fenced Main reply=%+v err=%v", completion, err)
+	}
+}
+
 func TestConfirmedWorkChangeMustQuoteItsSourceMessage(t *testing.T) {
 	ctx := context.Background()
 	db := openWorkflowStore(t)

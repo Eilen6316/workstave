@@ -53,6 +53,10 @@ func TestOpenMigratesV4OperationAndConclusionFields(t *testing.T) {
 		`INSERT INTO conversations VALUES ('conv-1','w1',1)`,
 		`INSERT INTO messages VALUES ('msg-1','w1','conv-1','user','source',NULL,1)`,
 		`INSERT INTO mailbox(work_id,conversation_id,message_id,harness,state,accepted_at,started_at) VALUES ('w1','conv-1','msg-1','codex','processing',1,2)`,
+		`INSERT INTO messages VALUES ('msg-2','w1','conv-1','user','pending input',NULL,1)`,
+		`INSERT INTO mailbox(work_id,conversation_id,message_id,harness,state,accepted_at) VALUES ('w1','conv-1','msg-2','codex','pending',1)`,
+		`INSERT INTO messages VALUES ('msg-3','w1','conv-1','user','another pending input',NULL,1)`,
+		`INSERT INTO mailbox(work_id,conversation_id,message_id,harness,state,accepted_at) VALUES ('w1','conv-1','msg-3','codex','pending',1)`,
 		`INSERT INTO runs(id,session_id,op_id,started_at,dispatch) VALUES ('run-1','main-1','main-msg-1',2,'dispatching')`,
 		`INSERT INTO main_runs VALUES ('run-1','w1','conv-1',1,'msg-1','{}',1,1,NULL,2,NULL)`,
 		`INSERT INTO work_facts VALUES ('w1','requirement','auth_method',1,'JWT','confirmed','msg-1',1)`,
@@ -74,6 +78,14 @@ func TestOpenMigratesV4OperationAndConclusionFields(t *testing.T) {
 	item, err := db.MailboxByMessage(ctx, "msg-1")
 	if err != nil || item.OpID != "main-msg-1" {
 		t.Fatalf("legacy Mailbox identity=%+v err=%v", item, err)
+	}
+	pending, err := db.MailboxByMessage(ctx, "msg-2")
+	if err != nil || pending.OpID == "" || pending.OpID == "main-msg-2" || pending.OpID == item.OpID {
+		t.Fatalf("legacy pending Mailbox identity=%+v err=%v, want a fresh Kernel-assigned identity not derived from the Message ID", pending, err)
+	}
+	secondPending, err := db.MailboxByMessage(ctx, "msg-3")
+	if err != nil || secondPending.OpID == "" || secondPending.OpID == pending.OpID {
+		t.Fatalf("second legacy pending Mailbox identity=%+v err=%v, want an identity distinct from %q", secondPending, err, pending.OpID)
 	}
 	var basis, intentHash string
 	if err := db.sql.QueryRowContext(ctx, `SELECT confirmation_basis FROM work_facts WHERE source_message_id='msg-1'`).Scan(&basis); err != nil || basis != "legacy" {

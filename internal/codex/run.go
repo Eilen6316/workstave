@@ -76,7 +76,9 @@ func buildArgs(o Options) []string {
 		if o.Model != "" {
 			a = append(a, "--model", o.Model)
 		}
-		return append(a, o.Prompt)
+		// The prompt is read from stdin ("-"): a multi-line argument is cut at its first
+		// newline by the npm .cmd wrapper on Windows, which silently drops the rest.
+		return append(a, "-")
 	}
 	a := []string{"exec", "--json", "--skip-git-repo-check"}
 	for _, override := range o.ConfigOverrides {
@@ -85,7 +87,7 @@ func buildArgs(o Options) []string {
 	if o.Model != "" {
 		a = append(a, "--model", o.Model)
 	}
-	a = append(a, "-s", sandbox, "-C", o.Dir, o.Prompt)
+	a = append(a, "-s", sandbox, "-C", o.Dir, "-")
 	return a
 }
 
@@ -98,6 +100,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	}
 	cmd := exec.CommandContext(ctx, bin, buildArgs(o)...)
 	cmd.Dir = o.Dir
+	cmd.Stdin = strings.NewReader(o.Prompt)
 	procgroup.Configure(cmd)
 	// Context cancellation kills the whole process tree, not just the direct child.
 	cmd.Cancel = func() error { return procgroup.Kill(cmd.Process.Pid) }
@@ -110,6 +113,13 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("codex: start %q: %w", bin, err)
 	}
+	// On Windows the tree is contained in a Job Object so an owner crash cannot leave it running.
+	if err := procgroup.Attach(cmd.Process.Pid); err != nil {
+		_ = procgroup.Kill(cmd.Process.Pid)
+		_ = cmd.Wait()
+		return Result{}, fmt.Errorf("codex: contain process tree: %w", err)
+	}
+	defer procgroup.Release(cmd.Process.Pid)
 
 	if o.OnProcess != nil {
 		o.OnProcess(cmd.Process.Pid)

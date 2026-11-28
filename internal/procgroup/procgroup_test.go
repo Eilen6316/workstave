@@ -19,7 +19,31 @@ const beatEnv = "PROCGROUP_TEST_BEAT"
 
 func TestMain(m *testing.M) {
 	switch os.Getenv(roleEnv) {
+	case "owner":
+		// Starts a parent, contains it in a Job Object and then idles until it is killed.
+		p := exec.Command(os.Args[0], "-test.run=^$")
+		p.Env = append(os.Environ(), roleEnv+"=parent")
+		Configure(p)
+		if err := p.Start(); err != nil {
+			os.Exit(2)
+		}
+		if err := Attach(p.Process.Pid); err != nil {
+			os.Exit(3)
+		}
+		_ = os.WriteFile(os.Getenv(beatEnv)+".go", nil, 0o600)
+		for {
+			time.Sleep(time.Hour)
+		}
 	case "parent":
+		// With PROCGROUP_TEST_WAIT_GO the grandchild starts only after the owner has attached
+		// this process to its Job Object, so the grandchild is a member of the job.
+		if os.Getenv("PROCGROUP_TEST_WAIT_GO") == "1" {
+			for start := time.Now(); time.Since(start) < 10*time.Second; time.Sleep(20 * time.Millisecond) {
+				if _, err := os.Stat(os.Getenv(beatEnv) + ".go"); err == nil {
+					break
+				}
+			}
+		}
 		gc := exec.Command(os.Args[0], "-test.run=^$")
 		gc.Env = append(os.Environ(), roleEnv+"=grandchild")
 		if err := gc.Start(); err != nil {

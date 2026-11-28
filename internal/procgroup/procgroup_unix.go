@@ -16,6 +16,13 @@ func Configure(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// Attach is a no-op on Unix: a process group does not outlive-kill itself when the owner dies,
+// so an owner crash leaves the group running. Only Windows contains the tree with a Job Object.
+func Attach(pid int) error { return nil }
+
+// Release is a no-op on Unix.
+func Release(pid int) {}
+
 // Kill sends SIGKILL to the process group led by pid.
 func Kill(pid int) error {
 	return syscall.Kill(-pid, syscall.SIGKILL)

@@ -191,7 +191,9 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 		execution.Outcome = outcome.Unknown
 	}
 	completion := store.MainCompletion{ReplyID: p.ReplyID, Reply: execution.Text, Result: "completed"}
-	if execution.Outcome != outcome.Unknown && p.DecodeReply != nil {
+	// Only a Completed Run has a final reply to decode. Decoding the empty text of a failed Run
+	// would replace the observed failure with invalid_main_response.
+	if execution.Outcome == outcome.Completed && p.DecodeReply != nil {
 		decoded, decodeErr := p.DecodeReply(execution.Text)
 		if decodeErr != nil {
 			completion = store.MainCompletion{ReplyID: p.ReplyID, Reply: execution.Text, Result: "failed", ResultDetail: "invalid_main_response"}

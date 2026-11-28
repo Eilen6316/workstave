@@ -136,7 +136,7 @@ const schemaVersion = 6
 // Open opens or creates the database at path and applies the schema. Every connection runs
 // with synchronous=FULL so a committed record survives a power loss, not only a process crash.
 func Open(ctx context.Context, path string) (*DB, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %q: %w", path, err)
@@ -172,7 +172,7 @@ func Open(ctx context.Context, path string) (*DB, error) {
 // acceptance transaction while the Runtime owner holds the state-directory lock. It performs no
 // schema changes.
 func OpenControl(ctx context.Context, path string) (*DB, error) {
-	dsn := "file:" + path + "?mode=rw&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	dsn := "file:" + path + "?mode=rw&_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open control connection %q: %w", path, err)

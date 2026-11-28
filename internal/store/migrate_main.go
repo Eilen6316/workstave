@@ -7,7 +7,12 @@ import (
 )
 
 // migrateIdentityAndResults adds operation identity, Run intent and Mailbox conclusion data.
-// Existing Mailbox IDs become stable legacy operation IDs so pending inputs remain addressable.
+// Scope: databases created before Mailbox rows carried an operation identity. A Mailbox input that
+// already has a Main Run keeps that Run's recorded op_id, because the Run identity was persisted
+// before launch and must still correlate. An input without a Run gets a fresh Kernel-assigned
+// identity instead of one derived from its Message ID.
+// Exit condition: delete this migration once no supported database predates the schema version
+// that added mailbox.op_id.
 func migrateIdentityAndResults(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -40,7 +45,9 @@ func migrateIdentityAndResults(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE mailbox SET op_id = 'main-' || message_id WHERE op_id = ''`); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE mailbox SET op_id = COALESCE(
+			(SELECT r.op_id FROM main_runs mr JOIN runs r ON r.id = mr.run_id WHERE mr.mailbox_sequence = mailbox.sequence),
+			'op-' || lower(hex(randomblob(16)))) WHERE op_id = ''`); err != nil {
 		return fmt.Errorf("store: assign legacy Mailbox operation identities: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE works SET main_harness = COALESCE(

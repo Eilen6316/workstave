@@ -91,6 +91,13 @@ func Run(ctx context.Context, o Options) (Result, error) {
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("claudecode: start %q: %w", bin, err)
 	}
+	// On Windows the tree is contained in a Job Object so an owner crash cannot leave it running.
+	if err := procgroup.Attach(cmd.Process.Pid); err != nil {
+		_ = procgroup.Kill(cmd.Process.Pid)
+		_ = cmd.Wait()
+		return Result{}, fmt.Errorf("claudecode: contain process tree: %w", err)
+	}
+	defer procgroup.Release(cmd.Process.Pid)
 	if o.OnProcess != nil {
 		o.OnProcess(cmd.Process.Pid)
 	}

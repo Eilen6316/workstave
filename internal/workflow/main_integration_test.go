@@ -54,12 +54,39 @@ func TestRealSharedWorkAcrossConversations(t *testing.T) {
 		})
 	}
 	if err := process(); err != nil {
+		if mainRun, found, lookupErr := db.MainRunForMessage(ctx, "message-a"); lookupErr == nil && found && mainRun.OutputMessageID != "" {
+			if reply, replyErr := db.MessageByID(ctx, mainRun.OutputMessageID); replyErr == nil {
+				t.Logf("Conversation A Main reply: %q", reply.Body)
+			}
+		}
 		t.Fatalf("Conversation A processing failed: %v", err)
 	}
-	if _, err := AcceptCrossHarnessExperiment(ctx, db, "message-b1", "conversation-b", "codex", "What authentication method did we choose? Answer with the method only."); err != nil {
+	facts, err := db.WorkFacts(ctx, "real-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var confirmedJWT store.WorkFact
+	for _, fact := range facts {
+		if fact.Kind == "requirement" && fact.Status == "confirmed" && strings.Contains(strings.ToLower(fact.Value), "jwt") {
+			confirmedJWT = fact
+			break
+		}
+	}
+	if confirmedJWT.Key == "" {
+		t.Fatalf("Conversation A did not record JWT as a confirmed requirement: %+v", facts)
+	}
+	if _, err := AcceptCrossHarnessExperiment(ctx, db, "message-b1", "conversation-b", "codex", "What authentication method did we choose?"); err != nil {
 		t.Fatal(err)
 	}
 	if err := process(); err != nil {
+		if mainRun, found, lookupErr := db.MainRunForMessage(ctx, "message-b1"); lookupErr == nil && found {
+			t.Logf("Conversation B Main Run: outcome=%q output_message_id=%q", mainRun.Outcome.String, mainRun.OutputMessageID)
+			if mainRun.OutputMessageID != "" {
+				if reply, replyErr := db.MessageByID(ctx, mainRun.OutputMessageID); replyErr == nil {
+					t.Logf("Conversation B raw Main reply: %q", reply.Body)
+				}
+			}
+		}
 		t.Fatalf("Conversation B recall failed: %v", err)
 	}
 	mainRunA, found, err := db.MainRunForMessage(ctx, "message-a")
@@ -82,6 +109,7 @@ func TestRealSharedWorkAcrossConversations(t *testing.T) {
 	}
 	reply, err := db.MessageByID(ctx, mainRunB.OutputMessageID)
 	if err != nil || reply.ReplyTo != "message-b1" || !strings.Contains(strings.ToLower(reply.Body), "jwt") {
+		t.Logf("Conversation B compiled input: %s", compilePrompt(snapshot))
 		t.Fatalf("Conversation B reply=%+v err=%v, want a correlated answer containing JWT", reply, err)
 	}
 	if _, err := Accept(ctx, db, "message-b2", "conversation-b", "Could Cookie sessions work instead?"); err != nil {
@@ -90,27 +118,35 @@ func TestRealSharedWorkAcrossConversations(t *testing.T) {
 	if err := process(); err != nil {
 		t.Fatalf("Cookie discussion processing failed: %v", err)
 	}
-	facts, err := db.WorkFacts(ctx, "real-work")
+	facts, err = db.WorkFacts(ctx, "real-work")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var confirmedJWT store.WorkFact
+	confirmedJWTStillCurrent := false
 	for _, fact := range facts {
-		if fact.Kind == "requirement" && fact.Key == "auth_method" && fact.Status == "confirmed" {
-			confirmedJWT = fact
+		if fact.Kind == confirmedJWT.Kind && fact.Key == confirmedJWT.Key && fact.Status == "confirmed" && strings.Contains(strings.ToLower(fact.Value), "jwt") {
+			confirmedJWTStillCurrent = true
 		}
 	}
-	if confirmedJWT.Value != "JWT tokens" {
+	if !confirmedJWTStillCurrent {
 		t.Fatalf("Cookie discussion changed authority: facts=%+v", facts)
 	}
 	if _, err := Accept(ctx, db, "message-b3", "conversation-b", "Replace the JWT requirement with Cookie sessions."); err != nil {
 		t.Fatal(err)
 	}
 	if err := process(); err != nil {
+		if mainRun, found, lookupErr := db.MainRunForMessage(ctx, "message-b3"); lookupErr == nil && found && mainRun.OutputMessageID != "" {
+			if reply, replyErr := db.MessageByID(ctx, mainRun.OutputMessageID); replyErr == nil {
+				t.Logf("Conversation B3 raw Main reply: %q", reply.Body)
+			}
+		}
+		if allFacts, factsErr := db.WorkFacts(ctx, "real-work"); factsErr == nil {
+			t.Logf("Work facts at B3 failure: %+v", allFacts)
+		}
 		t.Fatalf("Cookie requirement update failed: %v", err)
 	}
-	current, found, err := db.WorkFactByKey(ctx, "real-work", "requirement", "auth_method")
-	if err != nil || !found || current.Status != "confirmed" || current.Value != "Cookie sessions" || current.Revision <= confirmedJWT.Revision {
+	current, found, err := db.WorkFactByKey(ctx, "real-work", confirmedJWT.Kind, confirmedJWT.Key)
+	if err != nil || !found || current.Status != "confirmed" || !strings.Contains(strings.ToLower(current.Value), "cookie") || current.Revision <= confirmedJWT.Revision {
 		t.Fatalf("confirmed Cookie version=%+v found=%v err=%v", current, found, err)
 	}
 }

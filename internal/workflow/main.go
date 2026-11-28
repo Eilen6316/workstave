@@ -169,11 +169,15 @@ func compilePrompt(input inputSnapshot) string {
 		}
 	}
 	fmt.Fprintf(&b, "Current user message from Conversation %s:\n%s\n", input.ConversationID, input.CurrentInput)
-	b.WriteString("Return JSON only. Do not use tools for this request.")
+	b.WriteString("The reply field must directly answer the current user message using the Work facts above. Do not acknowledge these instructions or describe the JSON format. Return JSON only. Do not use tools for this request.")
 	return b.String()
 }
 
 func decodeMainReply(text string) (store.MainCompletion, error) {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "```json") && strings.HasSuffix(text, "```") {
+		text = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "```json"), "```"))
+	}
 	var response structuredReply
 	if err := json.Unmarshal([]byte(text), &response); err != nil {
 		return store.MainCompletion{}, fmt.Errorf("workflow: decode Main response: %w", err)
