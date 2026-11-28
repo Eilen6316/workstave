@@ -16,12 +16,13 @@ import (
 
 // Event is one JSONL line from stdout. Raw keeps the original bytes for evidence.
 type Event struct {
-	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype"`
-	IsError   bool            `json:"is_error"`
-	SessionID string          `json:"session_id"`
-	Result    string          `json:"result"`
-	Raw       json.RawMessage `json:"-"`
+	Type         string          `json:"type"`
+	Subtype      string          `json:"subtype"`
+	IsError      bool            `json:"is_error"`
+	SessionID    string          `json:"session_id"`
+	Result       string          `json:"result"`
+	SystemPrompt string          `json:"system_prompt"`
+	Raw          json.RawMessage `json:"-"`
 }
 
 // Options describes one print-mode invocation.
@@ -40,6 +41,13 @@ type Options struct {
 	// JSONSchema, when non-empty, is passed to --json-schema so the final answer is returned as
 	// schema-validated structured output instead of free text.
 	JSONSchema string
+	// AppendSystemPrompt, when non-empty, is passed to --append-system-prompt. It appends to the
+	// active system prompt (including any gateway-injected content) rather than replacing it, so
+	// user Harness configuration is preserved.
+	AppendSystemPrompt string
+	// CaptureSystemPrompt, when true, passes --system-prompt-snapshot on so the effective system
+	// prompt (including any injected content) is recorded in the event stream for diagnosis.
+	CaptureSystemPrompt bool
 	// OnEvent, if set, is called synchronously for each parsed event, in order, on the
 	// goroutine that called Run. It lets the caller cancel the context mid-run.
 	OnEvent func(Event)
@@ -49,9 +57,10 @@ type Options struct {
 
 // Result is what one invocation actually produced.
 type Result struct {
-	Events   []Event
-	ExitCode int
-	Stderr   string
+	Events       []Event
+	ExitCode     int
+	Stderr       string
+	SystemPrompt string // populated when CaptureSystemPrompt is true; empty otherwise
 }
 
 func buildArgs(o Options) []string {
@@ -67,6 +76,12 @@ func buildArgs(o Options) []string {
 	a = append(a, "--strict-mcp-config", "--permission-mode", "dontAsk")
 	if o.AllowedTools != "" {
 		a = append(a, "--allowedTools", o.AllowedTools)
+	}
+	if o.AppendSystemPrompt != "" {
+		a = append(a, "--append-system-prompt", o.AppendSystemPrompt)
+	}
+	if o.CaptureSystemPrompt {
+		a = append(a, "--system-prompt-snapshot", "on")
 	}
 	if o.JSONSchema != "" {
 		a = append(a, "--json-schema", o.JSONSchema)
@@ -129,6 +144,9 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		}
 		ev.Raw = line
 		res.Events = append(res.Events, ev)
+		if o.CaptureSystemPrompt && ev.Type == "system" && ev.Subtype == "init" && ev.SystemPrompt != "" {
+			res.SystemPrompt = ev.SystemPrompt
+		}
 		if o.OnEvent != nil {
 			o.OnEvent(ev)
 		}

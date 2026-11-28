@@ -117,6 +117,9 @@ func TestTwoConversationsShareWorkFactsAndKeepHistorySeparate(t *testing.T) {
 	if claude.callCount != 1 || codex.callCount != 1 || codex.requests[0].Resume {
 		t.Fatalf("calls claude=%d codex=%d request=%+v", claude.callCount, codex.callCount, codex.requests)
 	}
+	if claude.requests[0].OutputSchema != "" || codex.requests[0].OutputSchema != mainOutputSchema {
+		t.Fatalf("Harness output schemas Claude=%q Codex_matches=%t", claude.requests[0].OutputSchema, codex.requests[0].OutputSchema == mainOutputSchema)
+	}
 	if strings.Contains(codex.requests[0].Prompt, "delta-zebra") || !strings.Contains(codex.requests[0].Prompt, "weekly report is TSV") || !strings.Contains(codex.requests[0].Prompt, "What report format was agreed?") {
 		t.Fatalf("Conversation B prompt did not isolate history and include shared Work state:\n%s", codex.requests[0].Prompt)
 	}
@@ -354,6 +357,78 @@ func TestConcurrentProcessorsDoNotRecoverOrApplyNextMessage(t *testing.T) {
 	}
 	if fact, found, err := db.WorkFactByKey(ctx, "work-1", "requirement", "auth_method"); err != nil || !found || fact.Value != "use JWT." {
 		t.Fatalf("second input fact = %+v found=%v err=%v", fact, found, err)
+	}
+}
+
+func TestClaudeMainReceivesAppendSystemPromptCodexDoesNot(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	if err := db.CreateWorkWithHarness(ctx, "work-1", "main-1", "claude-code", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"conv-claude", "conv-codex"} {
+		if err := db.CreateConversation(ctx, id, "work-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Accept(ctx, db, "msg-claude", "conv-claude", "Note something."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcceptCrossHarnessExperiment(ctx, db, "msg-codex", "conv-codex", "codex", "Note something."); err != nil {
+		t.Fatal(err)
+	}
+	claude := &fakeHarness{name: "claude-code", nativeID: "nat-c", ackID: "nat-c", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"ok","changes":[]}`}}
+	codex := &fakeHarness{name: "codex", ackID: "thread-x", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"ok","changes":[]}`}}
+	if err := ProcessPending(ctx, db, "work-1", "/work", func(name string) (runner.Harness, error) {
+		switch name {
+		case "claude-code":
+			return claude, nil
+		case "codex":
+			return codex, nil
+		default:
+			t.Fatalf("unexpected harness %q", name)
+			return nil, nil
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if claude.requests[0].AppendSystemPrompt == "" {
+		t.Error("claude-code Main did not receive AppendSystemPrompt")
+	}
+	if !strings.Contains(claude.requests[0].AppendSystemPrompt, "JSON") {
+		t.Errorf("claude-code AppendSystemPrompt does not mention JSON: %q", claude.requests[0].AppendSystemPrompt)
+	}
+	if codex.requests[0].AppendSystemPrompt != "" {
+		t.Errorf("codex Main received unexpected AppendSystemPrompt: %q", codex.requests[0].AppendSystemPrompt)
+	}
+}
+
+func TestNoChangeExtractedDetailWhenChangesEmpty(t *testing.T) {
+	ctx := context.Background()
+	db := openWorkflowStore(t)
+	if err := db.CreateWork(ctx, "work-1", "main-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateConversation(ctx, "conv-a", "work-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Accept(ctx, db, "msg-a", "conv-a", "Just a question, no fact change."); err != nil {
+		t.Fatal(err)
+	}
+	// Harness returns valid JSON with an empty changes array — decode succeeds but nothing extracted.
+	harness := &fakeHarness{name: "codex", ackID: "thread-1", result: runner.Execution{Outcome: outcome.Completed, Text: `{"reply":"No changes needed.","changes":[]}`}}
+	if err := ProcessPending(ctx, db, "work-1", "/work", func(string) (runner.Harness, error) { return harness, nil }); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := db.MailboxByMessage(ctx, "msg-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mailbox.Result != "completed" {
+		t.Fatalf("Mailbox.Result = %q, want completed", mailbox.Result)
+	}
+	if mailbox.ResultDetail != "no_change_extracted" {
+		t.Fatalf("Mailbox.ResultDetail = %q, want no_change_extracted", mailbox.ResultDetail)
 	}
 }
 

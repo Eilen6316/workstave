@@ -30,7 +30,9 @@ func (Claude) NewNativeID() string {
 
 func (c Claude) Execute(ctx context.Context, req Request, onAcknowledged func(string)) (Execution, error) {
 	res, err := claudecode.Run(ctx, claudecode.Options{
-		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt, MaxBudget: c.MaxBudget, Model: c.Model, JSONSchema: req.OutputSchema,
+		Dir: req.Dir, SessionID: req.NativeID, Resume: req.Resume, Prompt: req.Prompt,
+		MaxBudget: c.MaxBudget, Model: c.Model, JSONSchema: req.OutputSchema,
+		AppendSystemPrompt: req.AppendSystemPrompt,
 		OnEvent: func(ev claudecode.Event) {
 			if ev.Type == "system" && ev.Subtype == "init" {
 				onAcknowledged(ev.SessionID)

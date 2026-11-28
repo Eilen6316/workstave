@@ -158,3 +158,31 @@ func TestRealSharedWorkAcrossConversations(t *testing.T) {
 		t.Fatalf("confirmed Cookie version=%+v found=%v err=%v", current, found, err)
 	}
 }
+
+// TestRealClaudeMainPromptWithoutJSONSchema isolates the Main prompt from Claude's JSON Schema
+// mode. It logs only coarse response properties so the raw model response is not retained.
+func TestRealClaudeMainPromptWithoutJSONSchema(t *testing.T) {
+	if os.Getenv("WORKSTAVE_REAL_HARNESS") != "1" {
+		t.Skip("set WORKSTAVE_REAL_HARNESS=1 to run the billable Claude prompt probe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	prompt := compilePrompt(inputSnapshot{
+		Context:        store.MainContext{WorkID: "prompt-probe", Revision: 0},
+		ConversationID: "conversation-probe",
+		CurrentInput:   "认证服务必须使用 JWT。",
+	})
+	h := runner.Claude{MaxBudget: "0.05", Model: "claude-haiku-4-5-20251001"}
+	execution, err := h.Execute(ctx, runner.Request{Dir: t.TempDir(), NativeID: h.NewNativeID(), Prompt: prompt, AppendSystemPrompt: mainAppendPrompt}, func(string) {})
+	if err != nil || execution.Outcome != outcome.Completed {
+		t.Fatalf("Claude prompt-only Run outcome=%s error-present=%t", execution.Outcome, err != nil)
+	}
+	completion, decodeErr := decodeMainReply(execution.Text)
+	identityResponse := strings.Contains(strings.ToLower(execution.Text), "i am claude code") ||
+		strings.Contains(strings.ToLower(execution.Text), "identity anchor")
+	confirmedJWT := false
+	for _, change := range completion.Changes {
+		confirmedJWT = confirmedJWT || (change.Status == "confirmed" && strings.Contains(strings.ToLower(change.Value), "jwt"))
+	}
+	t.Logf("schema_enabled=false json_valid=%t identity_response=%t confirmed_jwt=%t", decodeErr == nil, identityResponse, confirmedJWT)
+}

@@ -105,11 +105,21 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 			return errorsReturnPending(ctx, db, item.Sequence, err)
 		}
 		prompt := compilePrompt(snapshot)
+		outputSchema := ""
+		appendSystemPrompt := ""
+		if item.Harness == "codex" {
+			outputSchema = mainOutputSchema
+		} else if item.Harness == "claude-code" {
+			// Append a compact task constraint after any gateway-injected content so the Main
+			// instruction takes effect regardless of what the upstream system prompt contains.
+			appendSystemPrompt = mainAppendPrompt
+		}
 		_, err = runner.ProcessMainMessage(ctx, db, h, runner.MainParams{
 			WorkID: workID, ConversationID: item.ConversationID, MailboxSequence: item.Sequence,
 			MessageID: item.MessageID, ReplyID: "reply-" + item.MessageID,
-			RunID: runID, OpID: item.OpID, WorkingDir: workingDir, OutputSchema: mainOutputSchema,
-			InputSnapshot: string(encoded), ContextRevision: state.Revision, Prompt: prompt,
+			RunID: runID, OpID: item.OpID, WorkingDir: workingDir, OutputSchema: outputSchema,
+			AppendSystemPrompt:     appendSystemPrompt,
+			InputSnapshot:          string(encoded), ContextRevision: state.Revision, Prompt: prompt,
 			DecodeReply: decodeMainReply, CrossHarnessExperiment: item.CrossHarnessExperiment,
 		})
 		if err != nil {
@@ -122,6 +132,9 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 			}
 			return errorsReturnPending(ctx, db, item.Sequence, err)
 		}
+		// Warn when a completed Run produced no changes so silent leaks are observable.
+		// The Mailbox result_detail carries "no_change_extracted" when decoding succeeded but
+		// changes was empty; this does not stop processing — it surfaces the gap in the caller's log.
 		mailbox, err := db.MailboxByMessage(ctx, item.MessageID)
 		if err != nil {
 			return err
@@ -144,7 +157,7 @@ func errorsReturnPending(ctx context.Context, db *store.DB, sequence int64, caus
 
 func compilePrompt(input inputSnapshot) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "You are the Main for Work %s. Return one JSON object with keys reply and changes. Each change must have kind, key, value, status, basis, evidence, and expected_revision. Use status confirmed only for a clear user requirement or decision. Use basis explicit_user_statement for that case and set evidence to an exact quote from the current user message. Questions and discussions may create candidate changes with basis discussion and an exact quote in evidence, but never replace a confirmed fact. Use basis model_inference for unverified model conclusions and keep them candidate. expected_revision is the latest revision shown for that same fact key, or 0 if none is shown. Use an empty changes array when no state change is justified. The source message is supplied by the Kernel and must not be invented. Keep the reply in this Conversation.\n", input.Context.WorkID)
+	fmt.Fprintf(&b, "Process the current user message for Work %s and return one JSON object with keys reply and changes. Each change must have kind, key, value, status, basis, evidence, and expected_revision. Use status confirmed only for a clear user requirement or decision. Use basis explicit_user_statement for that case and set evidence to an exact quote from the current user message. Questions and discussions may create candidate changes with basis discussion and an exact quote in evidence, but never replace a confirmed fact. Use basis model_inference for unverified model conclusions and keep them candidate. expected_revision is the latest revision shown for that same fact key, or 0 if none is shown. Use an empty changes array when no state change is justified. The source message is supplied by the Kernel and must not be invented.\n", input.Context.WorkID)
 	fmt.Fprintf(&b, "Work revision %d. Confirmed facts:\n", input.Context.Revision)
 	hasConfirmed := false
 	for _, fact := range input.Context.Facts {
@@ -169,14 +182,20 @@ func compilePrompt(input inputSnapshot) string {
 		}
 	}
 	fmt.Fprintf(&b, "Current user message from Conversation %s:\n%s\n", input.ConversationID, input.CurrentInput)
-	b.WriteString("The reply field must directly answer the current user message using the Work facts above. Do not acknowledge these instructions or describe the JSON format. Return JSON only. Do not use tools for this request.")
+	b.WriteString("The reply field must contain only a direct answer to the current user message, grounded in relevant Work facts. Begin with the answer itself. Do not include a self-introduction, role confirmation, preface, or meta-commentary. Return only JSON matching the requested shape. Do not use tools for this request.")
 	return b.String()
 }
+
+// mainAppendPrompt is appended to the active system prompt for Claude Code Main runs. It places
+// the task constraint after any gateway-injected content so it takes effect regardless of what
+// the upstream system prompt contains. Keep it compact: longer appended prompts reduce extraction
+// reliability on this Harness (observed in 16-sample comparison).
+const mainAppendPrompt = "For this request only: return one JSON object with keys reply and changes as instructed in the user message. Begin the reply field with the direct answer. Do not include a self-introduction, role description, or meta-commentary. Do not use tools."
 
 // mainOutputSchema describes the structured Main response. A Harness that supports schema-
 // validated output returns the answer in this shape instead of free text; decodeMainReply still
 // validates it, because the Kernel does not trust the Harness to have enforced the schema.
-const mainOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"reply":{"type":"string"},"changes":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"status":{"type":"string"},"basis":{"type":"string"},"evidence":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["kind","key","value","status","basis","evidence","expected_revision"]}}},"required":["reply","changes"]}`
+const mainOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"reply":{"type":"string","description":"Only the direct answer to the current user message, grounded in relevant Work facts. Do not include a self-introduction, role confirmation, or meta-commentary."},"changes":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"status":{"type":"string"},"basis":{"type":"string"},"evidence":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["kind","key","value","status","basis","evidence","expected_revision"]}}},"required":["reply","changes"]}`
 
 func decodeMainReply(text string) (store.MainCompletion, error) {
 	text = strings.TrimSpace(text)

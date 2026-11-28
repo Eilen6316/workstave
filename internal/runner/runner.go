@@ -26,6 +26,9 @@ type Request struct {
 	// OutputSchema is an optional JSON Schema for a structured final answer. Each adapter passes
 	// it through the corresponding Harness CLI option when available.
 	OutputSchema string
+	// AppendSystemPrompt, when non-empty, is appended to the active system prompt. Only Claude
+	// Code supports this; other adapters ignore it.
+	AppendSystemPrompt string
 }
 
 // Execution contains the terminal outcome and final assistant text observed from the Harness.
@@ -72,6 +75,9 @@ type MainParams struct {
 	ContextRevision        int64
 	Prompt                 string
 	OutputSchema           string
+	// AppendSystemPrompt, when non-empty, is forwarded to the Request so the Claude adapter can
+	// pass it to --append-system-prompt. Other adapters ignore it.
+	AppendSystemPrompt     string
 	DecodeReply            func(string) (store.MainCompletion, error)
 	CrossHarnessExperiment bool
 }
@@ -168,7 +174,7 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 		AllowBindingReplacement: p.CrossHarnessExperiment,
 		InputSnapshot:           p.InputSnapshot, ContextRevision: p.ContextRevision,
 	}
-	req := Request{Dir: p.WorkingDir, NativeID: start.NativeID, Prompt: p.Prompt, OutputSchema: p.OutputSchema}
+	req := Request{Dir: p.WorkingDir, NativeID: start.NativeID, Prompt: p.Prompt, OutputSchema: p.OutputSchema, AppendSystemPrompt: p.AppendSystemPrompt}
 	if err == nil {
 		if binding.Harness == h.Name() {
 			if binding.NativeID == "" {
@@ -176,7 +182,7 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 			}
 			start.BindingID = binding.ID
 			start.NativeID = binding.NativeID
-			req = Request{Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true, OutputSchema: p.OutputSchema}
+			req = Request{Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true, OutputSchema: p.OutputSchema, AppendSystemPrompt: p.AppendSystemPrompt}
 		} else if !p.CrossHarnessExperiment {
 			return Execution{}, fmt.Errorf("runner: Main session %q is bound to %q; cross-Harness rebuild requires an explicit experiment", work.MainSessionID, binding.Harness)
 		}
@@ -204,6 +210,12 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 		} else {
 			completion = decoded
 			completion.ReplyID = p.ReplyID
+			if len(decoded.Changes) == 0 {
+				// Decode succeeded but the Run produced no changes. Record this so silent
+				// extraction gaps (e.g. a gateway-injected identity reply) are observable in
+				// the Mailbox rather than indistinguishable from a legitimately empty turn.
+				completion.ResultDetail = "no_change_extracted"
+			}
 		}
 	}
 	finishErr := db.CompleteMainRun(context.WithoutCancel(ctx), p.RunID, completion, execution.Outcome)
