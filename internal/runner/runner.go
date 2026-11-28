@@ -63,18 +63,18 @@ type ResumeParams struct {
 
 // MainParams associates a queued Conversation input with the Work's logical Main Run.
 type MainParams struct {
-	WorkID                 string
-	ConversationID         string
-	MailboxSequence        int64
-	MessageID              string
-	ReplyID                string
-	RunID                  string
-	OpID                   string
-	WorkingDir             string
-	InputSnapshot          string
-	ContextRevision        int64
-	Prompt                 string
-	OutputSchema           string
+	WorkID          string
+	ConversationID  string
+	MailboxSequence int64
+	MessageID       string
+	ReplyID         string
+	RunID           string
+	OpID            string
+	WorkingDir      string
+	InputSnapshot   string
+	ContextRevision int64
+	Prompt          string
+	OutputSchema    string
 	// AppendSystemPrompt, when non-empty, is forwarded to the Request so the Claude adapter can
 	// pass it to --append-system-prompt. Other adapters ignore it.
 	AppendSystemPrompt     string

@@ -118,8 +118,8 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 			WorkID: workID, ConversationID: item.ConversationID, MailboxSequence: item.Sequence,
 			MessageID: item.MessageID, ReplyID: "reply-" + item.MessageID,
 			RunID: runID, OpID: item.OpID, WorkingDir: workingDir, OutputSchema: outputSchema,
-			AppendSystemPrompt:     appendSystemPrompt,
-			InputSnapshot:          string(encoded), ContextRevision: state.Revision, Prompt: prompt,
+			AppendSystemPrompt: appendSystemPrompt,
+			InputSnapshot:      string(encoded), ContextRevision: state.Revision, Prompt: prompt,
 			DecodeReply: decodeMainReply, CrossHarnessExperiment: item.CrossHarnessExperiment,
 		})
 		if err != nil {
