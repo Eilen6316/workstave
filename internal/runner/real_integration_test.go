@@ -2,8 +2,10 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +58,76 @@ func TestRealCreateThenResume(t *testing.T) {
 				t.Fatalf("resumed run: ok=%v outcome=%q err=%v, want completed", ok, r.Outcome.String, err)
 			}
 		})
+	}
+}
+
+// TestRealResumeAfterNeedsInputCarriesNativeTaskContext checks whether the same native Session
+// supplies the prior task details to a new Run after the first Run asks the user for missing data.
+// Workstave has no persisted Task entity yet, so this observes native-session continuity only.
+func TestRealResumeAfterNeedsInputCarriesNativeTaskContext(t *testing.T) {
+	if os.Getenv("WORKSTAVE_REAL_HARNESS") != "1" {
+		t.Skip("set WORKSTAVE_REAL_HARNESS=1 to run the billable needs-input resume experiment")
+	}
+	cases := []struct {
+		name    string
+		harness Harness
+	}{
+		{"claude-code", Claude{MaxBudget: "0.05", Model: "claude-haiku-4-5-20251001"}},
+		{"codex", Codex{}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			db := open(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			defer cancel()
+			dir := t.TempDir()
+			params := Params{
+				SessionID: "s1", RunID: "r-needs-input", OpID: "op-needs-input", Dir: dir,
+				Prompt: "We need the arithmetic mean error rate for services Alpha and Beta. Alpha's error rate is 7.4%. Beta's rate is missing. Do not guess. Reply exactly NEEDS_INPUT: Beta error rate.",
+			}
+			first, err := CreateWithOutput(ctx, db, test.harness, params)
+			if err != nil || first.Outcome != outcome.Completed || !strings.Contains(strings.ToLower(first.Text), "needs_input") {
+				t.Fatalf("first Run did not complete with a needs-input request (outcome=%s, error-present=%t, needs-input-present=%t)", first.Outcome, err != nil, strings.Contains(strings.ToLower(first.Text), "needs_input"))
+			}
+
+			second, err := ResumeWithOutput(ctx, db, test.harness, ResumeParams{
+				SessionID: params.SessionID, RunID: "r-after-needs-input", OpID: "op-after-needs-input",
+				Prompt: "Beta's error rate is 3.6%. Give the Alpha rate, Beta rate, and arithmetic mean.",
+			})
+			if err != nil || second.Outcome != outcome.Completed {
+				t.Fatalf("follow-up Run outcome=%s error-present=%t, want completed", second.Outcome, err != nil)
+			}
+			answer := strings.ToLower(second.Text)
+			if !strings.Contains(answer, "7.4") || !strings.Contains(answer, "3.6") || !strings.Contains(answer, "5.5") {
+				t.Fatalf("follow-up Run did not use the previous task context: alpha_present=%t beta_present=%t mean_present=%t", strings.Contains(answer, "7.4"), strings.Contains(answer, "3.6"), strings.Contains(answer, "5.5"))
+			}
+		})
+	}
+}
+
+func TestRealCodexStructuredOutputSchema(t *testing.T) {
+	if os.Getenv("WORKSTAVE_REAL_HARNESS") != "1" {
+		t.Skip("set WORKSTAVE_REAL_HARNESS=1 to run the Codex structured-output probe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	schema := `{"type":"object","additionalProperties":false,"properties":{"reply":{"type":"string"},"changes":{"type":"array","items":{"type":"string"}}},"required":["reply","changes"]}`
+	var acknowledgedID string
+	execution, err := (Codex{}).Execute(ctx, Request{
+		Dir: t.TempDir(), Prompt: "Return reply exactly PONG and changes as an empty array.", OutputSchema: schema,
+	}, func(id string) { acknowledgedID = id })
+	if err != nil || execution.Outcome != outcome.Completed {
+		t.Fatalf("Codex structured-output Run outcome=%s error-present=%t", execution.Outcome, err != nil)
+	}
+	var response struct {
+		Reply   string   `json:"reply"`
+		Changes []string `json:"changes"`
+	}
+	if err := json.Unmarshal([]byte(execution.Text), &response); err != nil {
+		t.Fatalf("Codex structured-output response is not JSON: %v", err)
+	}
+	if response.Reply != "PONG" || response.Changes == nil || len(response.Changes) != 0 || acknowledgedID == "" {
+		t.Fatalf("Codex structured-output response=%+v correlated_thread_present=%t", response, acknowledgedID != "")
 	}
 }
 

@@ -23,6 +23,9 @@ type Request struct {
 	NativeID string
 	Prompt   string
 	Resume   bool
+	// OutputSchema is an optional JSON Schema for a structured final answer. Each adapter passes
+	// it through the corresponding Harness CLI option when available.
+	OutputSchema string
 }
 
 // Execution contains the terminal outcome and final assistant text observed from the Harness.
@@ -68,6 +71,7 @@ type MainParams struct {
 	InputSnapshot          string
 	ContextRevision        int64
 	Prompt                 string
+	OutputSchema           string
 	DecodeReply            func(string) (store.MainCompletion, error)
 	CrossHarnessExperiment bool
 }
@@ -164,7 +168,7 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 		AllowBindingReplacement: p.CrossHarnessExperiment,
 		InputSnapshot:           p.InputSnapshot, ContextRevision: p.ContextRevision,
 	}
-	req := Request{Dir: p.WorkingDir, NativeID: start.NativeID, Prompt: p.Prompt}
+	req := Request{Dir: p.WorkingDir, NativeID: start.NativeID, Prompt: p.Prompt, OutputSchema: p.OutputSchema}
 	if err == nil {
 		if binding.Harness == h.Name() {
 			if binding.NativeID == "" {
@@ -172,7 +176,7 @@ func ProcessMainMessage(ctx context.Context, db *store.DB, h Harness, p MainPara
 			}
 			start.BindingID = binding.ID
 			start.NativeID = binding.NativeID
-			req = Request{Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true}
+			req = Request{Dir: binding.WorkingDir, NativeID: binding.NativeID, Prompt: p.Prompt, Resume: true, OutputSchema: p.OutputSchema}
 		} else if !p.CrossHarnessExperiment {
 			return Execution{}, fmt.Errorf("runner: Main session %q is bound to %q; cross-Harness rebuild requires an explicit experiment", work.MainSessionID, binding.Harness)
 		}

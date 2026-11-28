@@ -73,6 +73,14 @@ func TestRealSharedWorkAcrossConversations(t *testing.T) {
 		}
 	}
 	if confirmedJWT.Key == "" {
+		if mainRun, found, lookupErr := db.MainRunForMessage(ctx, "message-a"); lookupErr == nil && found && mainRun.OutputMessageID != "" {
+			if reply, replyErr := db.MessageByID(ctx, mainRun.OutputMessageID); replyErr == nil {
+				t.Logf("Conversation A Main reply: %q", reply.Body)
+			}
+		}
+		if item, mailboxErr := db.MailboxByMessage(ctx, "message-a"); mailboxErr == nil {
+			t.Logf("Conversation A Mailbox state=%q result=%q detail=%q", item.State, item.Result, item.ResultDetail)
+		}
 		t.Fatalf("Conversation A did not record JWT as a confirmed requirement: %+v", facts)
 	}
 	if _, err := AcceptCrossHarnessExperiment(ctx, db, "message-b1", "conversation-b", "codex", "What authentication method did we choose?"); err != nil {

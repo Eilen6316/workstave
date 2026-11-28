@@ -37,6 +37,9 @@ type Options struct {
 	Tools string
 	// AllowedTools is passed to --allowedTools when non-empty (e.g. "Bash(ping *)").
 	AllowedTools string
+	// JSONSchema, when non-empty, is passed to --json-schema so the final answer is returned as
+	// schema-validated structured output instead of free text.
+	JSONSchema string
 	// OnEvent, if set, is called synchronously for each parsed event, in order, on the
 	// goroutine that called Run. It lets the caller cancel the context mid-run.
 	OnEvent func(Event)
@@ -52,10 +55,21 @@ type Result struct {
 }
 
 func buildArgs(o Options) []string {
-	a := []string{"-p", "--output-format", "stream-json", "--verbose",
-		"--tools", o.Tools, "--strict-mcp-config", "--permission-mode", "dontAsk"}
+	a := []string{"-p", "--output-format", "stream-json", "--verbose"}
+	// Use the equals form --tools= for an empty set so cmd.exe does not drop the token: a bare
+	// empty-string argument is silently discarded by the .cmd wrapper, shifting --strict-mcp-config
+	// into the value slot of --tools and disabling it.
+	if o.Tools != "" {
+		a = append(a, "--tools", o.Tools)
+	} else {
+		a = append(a, "--tools=")
+	}
+	a = append(a, "--strict-mcp-config", "--permission-mode", "dontAsk")
 	if o.AllowedTools != "" {
 		a = append(a, "--allowedTools", o.AllowedTools)
+	}
+	if o.JSONSchema != "" {
+		a = append(a, "--json-schema", o.JSONSchema)
 	}
 	if o.MaxBudget != "" {
 		a = append(a, "--max-budget-usd", o.MaxBudget)

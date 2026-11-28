@@ -108,7 +108,7 @@ func ProcessPending(ctx context.Context, db *store.DB, workID, workingDir string
 		_, err = runner.ProcessMainMessage(ctx, db, h, runner.MainParams{
 			WorkID: workID, ConversationID: item.ConversationID, MailboxSequence: item.Sequence,
 			MessageID: item.MessageID, ReplyID: "reply-" + item.MessageID,
-			RunID: runID, OpID: item.OpID, WorkingDir: workingDir,
+			RunID: runID, OpID: item.OpID, WorkingDir: workingDir, OutputSchema: mainOutputSchema,
 			InputSnapshot: string(encoded), ContextRevision: state.Revision, Prompt: prompt,
 			DecodeReply: decodeMainReply, CrossHarnessExperiment: item.CrossHarnessExperiment,
 		})
@@ -172,6 +172,11 @@ func compilePrompt(input inputSnapshot) string {
 	b.WriteString("The reply field must directly answer the current user message using the Work facts above. Do not acknowledge these instructions or describe the JSON format. Return JSON only. Do not use tools for this request.")
 	return b.String()
 }
+
+// mainOutputSchema describes the structured Main response. A Harness that supports schema-
+// validated output returns the answer in this shape instead of free text; decodeMainReply still
+// validates it, because the Kernel does not trust the Harness to have enforced the schema.
+const mainOutputSchema = `{"type":"object","additionalProperties":false,"properties":{"reply":{"type":"string"},"changes":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"status":{"type":"string"},"basis":{"type":"string"},"evidence":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["kind","key","value","status","basis","evidence","expected_revision"]}}},"required":["reply","changes"]}`
 
 func decodeMainReply(text string) (store.MainCompletion, error) {
 	text = strings.TrimSpace(text)

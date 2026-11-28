@@ -25,13 +25,16 @@ func (crashing) Execute(context.Context, Request, func(string)) (Execution, erro
 	return Execution{}, nil
 }
 
-type crashingAfterAck struct{}
+type crashingAfterAck struct{ terminalMarker string }
 
 func (crashingAfterAck) Name() string        { return "codex" }
 func (crashingAfterAck) NewNativeID() string { return "" }
-func (crashingAfterAck) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (Execution, error) {
+func (c crashingAfterAck) Execute(_ context.Context, _ Request, onAcknowledged func(string)) (Execution, error) {
 	onAcknowledged("thread-crash")
-	os.Exit(4) // the acknowledgement is committed, but the run outcome is not
+	if err := os.WriteFile(c.terminalMarker, []byte("terminal_event_observed"), 0o600); err != nil {
+		os.Exit(6)
+	}
+	os.Exit(4) // the terminal event was observed by the adapter, but the Run result is not persisted
 	return Execution{}, nil
 }
 
@@ -64,7 +67,12 @@ func TestHelperCrashAfterPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, created, err := db.BeginFirstRun(ctx, "r-pending", "s1", "codex", "/x", "", "op-pending", "intent-pending"); err != nil || !created {
+	p := Params{SessionID: "s1", RunID: "r-pending", OpID: "op-pending", Dir: "/x", Prompt: "resume the same pending operation"}
+	intent, err := intentFingerprint("create", p.SessionID, "codex", p.Dir, p.Prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, created, err := db.BeginFirstRun(ctx, p.RunID, p.SessionID, "codex", p.Dir, "", p.OpID, intent); err != nil || !created {
 		t.Fatalf("create pending run: created=%v err=%v", created, err)
 	}
 	os.Exit(5) // after the run commit, before dispatch authorization
@@ -84,7 +92,7 @@ func TestHelperCrashAfterAcknowledged(t *testing.T) {
 	if err := db.CreateSession(ctx, "s1", "w1", "worker"); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = Create(ctx, db, crashingAfterAck{}, params)
+	_, _ = Create(ctx, db, crashingAfterAck{terminalMarker: os.Getenv("WORKSTAVE_CRASH_TERMINAL_MARKER")}, params)
 	t.Fatal("Create returned; the harness should have terminated the process")
 }
 
@@ -174,16 +182,31 @@ func TestCrashAfterPendingRemainsPending(t *testing.T) {
 	if err := db.AuthorizeDispatch(ctx, "r-pending"); err == nil {
 		t.Fatal("pending run recovered while paused received a new dispatch authorization")
 	}
+	if err := db.SetWorkPaused(ctx, "w1", false); err != nil {
+		t.Fatal(err)
+	}
+	p := Params{SessionID: "s1", RunID: "r-pending", OpID: "op-pending", Dir: "/x", Prompt: "resume the same pending operation"}
+	f := &fake{name: "codex", ackID: "thread-pending-retry", out: outcome.Completed}
+	if got, err := Create(ctx, db, f, p); err != nil || got != outcome.Completed || f.calls != 1 {
+		t.Fatalf("same pending operation after unpause = %q err=%v harness_calls=%d, want one completed dispatch", got, err, f.calls)
+	}
+	if run, found, err := db.RunForOp(ctx, p.OpID); err != nil || !found || run.ID != p.RunID || run.Outcome.String != string(outcome.Completed) {
+		t.Fatalf("pending operation after retry=%+v found=%v err=%v", run, found, err)
+	}
 }
 
-func TestCrashAfterAcknowledgedIsRecoveredAsUnknown(t *testing.T) {
+func TestCrashAfterTerminalObservedBeforeResultWriteIsRecoveredAsUnknown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "acknowledged.db")
+	terminalMarker := filepath.Join(t.TempDir(), "terminal-event")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperCrashAfterAcknowledged$")
-	cmd.Env = append(os.Environ(), "WORKSTAVE_CRASH_ACK_DB="+path)
+	cmd.Env = append(os.Environ(), "WORKSTAVE_CRASH_ACK_DB="+path, "WORKSTAVE_CRASH_TERMINAL_MARKER="+terminalMarker)
 	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 4 {
 		t.Fatalf("helper did not exit with code 4: err=%v output=%s", err, out)
+	}
+	if data, err := os.ReadFile(terminalMarker); err != nil || string(data) != "terminal_event_observed" {
+		t.Fatalf("terminal observation marker=%q err=%v", data, err)
 	}
 
 	ctx := context.Background()
@@ -205,5 +228,11 @@ func TestCrashAfterAcknowledgedIsRecoveredAsUnknown(t *testing.T) {
 	r, ok, err := db.RunForOp(ctx, "op1")
 	if err != nil || !ok || r.Outcome.String != string(outcome.Unknown) {
 		t.Fatalf("run after recovery: ok=%v outcome=%q err=%v, want unknown", ok, r.Outcome.String, err)
+	}
+	f := &fake{name: "codex", ackID: "thread-duplicate", out: outcome.Completed}
+	retry := params
+	retry.RunID = "r-duplicate"
+	if _, err := Create(ctx, db, f, retry); err == nil || f.calls != 0 {
+		t.Fatalf("terminal-observed operation was relaunched: err=%v harness_calls=%d", err, f.calls)
 	}
 }

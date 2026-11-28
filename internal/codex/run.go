@@ -27,12 +27,13 @@ type Event struct {
 
 // Options describes one invocation.
 type Options struct {
-	Bin      string // executable; defaults to "codex"
-	Dir      string // working root passed via -C and used as the process directory
-	ThreadID string // when set, resume this thread instead of creating one
-	Model    string // optional model override for this invocation
-	Prompt   string // sent on stdin
-	Sandbox  string // defaults to read-only
+	Bin              string // executable; defaults to "codex"
+	Dir              string // working root passed via -C and used as the process directory
+	ThreadID         string // when set, resume this thread instead of creating one
+	Model            string // optional model override for this invocation
+	Prompt           string // sent on stdin
+	Sandbox          string // defaults to read-only
+	OutputSchemaPath string // optional JSON Schema file passed via --output-schema
 	// ConfigOverrides are passed via -c key=value to override config.toml settings.
 	// Use to disable features or restrict permissions, e.g. "features.web_search=false".
 	ConfigOverrides []string
@@ -45,12 +46,13 @@ type Options struct {
 
 // Result is what one invocation actually produced.
 type Result struct {
-	Events    []Event
-	ThreadID  string // from thread.started; empty if the stream never produced one
-	Failed    bool   // true only if a turn.failed event was observed
-	Completed bool   // true only if a turn.completed event was observed
-	ExitCode  int
-	Stderr    string
+	Events      []Event
+	ThreadID    string // from thread.started; empty if the stream never produced one
+	Failed      bool   // true only if a turn.failed event was observed
+	FailMessage string // the error.message from the turn.failed event, if any
+	Completed   bool   // true only if a turn.completed event was observed
+	ExitCode    int
+	Stderr      string
 }
 
 var secretPattern = regexp.MustCompile(`sk-[A-Za-z0-9*_\-]{6,}`)
@@ -76,6 +78,9 @@ func buildArgs(o Options) []string {
 		if o.Model != "" {
 			a = append(a, "--model", o.Model)
 		}
+		if o.OutputSchemaPath != "" {
+			a = append(a, "--output-schema", o.OutputSchemaPath)
+		}
 		// The prompt is read from stdin ("-"): a multi-line argument is cut at its first
 		// newline by the npm .cmd wrapper on Windows, which silently drops the rest.
 		return append(a, "-")
@@ -86,6 +91,9 @@ func buildArgs(o Options) []string {
 	}
 	if o.Model != "" {
 		a = append(a, "--model", o.Model)
+	}
+	if o.OutputSchemaPath != "" {
+		a = append(a, "--output-schema", o.OutputSchemaPath)
 	}
 	a = append(a, "-s", sandbox, "-C", o.Dir, "-")
 	return a
@@ -134,7 +142,10 @@ func Run(ctx context.Context, o Options) (Result, error) {
 		var env struct {
 			Type     string `json:"type"`
 			ThreadID string `json:"thread_id"`
-			Item     struct {
+			Error    struct {
+				Message string `json:"message"`
+			} `json:"error"`
+			Item struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"item"`
@@ -149,6 +160,7 @@ func Run(ctx context.Context, o Options) (Result, error) {
 			res.ThreadID = ev.ThreadID
 		case "turn.failed":
 			res.Failed = true
+			res.FailMessage = env.Error.Message
 		case "turn.completed":
 			res.Completed = true
 		}

@@ -47,6 +47,26 @@ func TestBuildArgsResumeWithConfigOverrides(t *testing.T) {
 	}
 }
 
+func TestBuildArgsPassesOutputSchemaPathForCreateAndResume(t *testing.T) {
+	for name, options := range map[string]Options{
+		"create": {OutputSchemaPath: `C:\Temp\schema files\output.json`},
+		"resume": {ThreadID: "thread-1", OutputSchemaPath: `C:\Temp\schema files\output.json`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			args := buildArgs(options)
+			for i, arg := range args {
+				if arg == "--output-schema" {
+					if i+1 >= len(args) || args[i+1] != options.OutputSchemaPath {
+						t.Fatalf("--output-schema args=%#v, want exact path %q", args, options.OutputSchemaPath)
+					}
+					return
+				}
+			}
+			t.Fatalf("--output-schema missing from args %#v", args)
+		})
+	}
+}
+
 // A multi-line prompt must never reach argv: the npm .cmd wrapper on Windows keeps only
 // the first line of such an argument and drops the rest without any error.
 func TestBuildArgsKeepsPromptOutOfArgv(t *testing.T) {

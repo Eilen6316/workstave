@@ -21,8 +21,11 @@ func TestRunDeliversMultiLinePromptThroughCmdWrapper(t *testing.T) {
 	}
 	dir := t.TempDir()
 	script := `const fs = require("fs");
-fs.writeFileSync(__dirname + "/argv.json", JSON.stringify(process.argv.slice(2)));
+const args = process.argv.slice(2);
+fs.writeFileSync(__dirname + "/argv.json", JSON.stringify(args));
 fs.writeFileSync(__dirname + "/stdin.txt", fs.readFileSync(0));
+const schemaIndex = args.indexOf("--output-schema");
+if (schemaIndex >= 0) fs.writeFileSync(__dirname + "/schema-readback.json", fs.readFileSync(args[schemaIndex + 1]));
 console.log(JSON.stringify({type:"thread.started",thread_id:"shim-thread"}));
 console.log(JSON.stringify({type:"turn.completed"}));
 `
@@ -36,9 +39,18 @@ console.log(JSON.stringify({type:"turn.completed"}));
 	}
 
 	prompt := "line one: instructions\nline two: confirmed JWT\nline three: user message"
+	schema := `{"type":"object","properties":{"reply":{"type":"string"},"changes":{"type":"array"}},"required":["reply","changes"]}`
+	schemaDir := filepath.Join(dir, "schema files")
+	if err := os.Mkdir(schemaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	schemaPath := filepath.Join(schemaDir, "output.json")
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for name, o := range map[string]Options{
-		"create": {Bin: bin, Dir: dir, Prompt: prompt},
-		"resume": {Bin: bin, Dir: dir, ThreadID: "thread-1", Prompt: prompt},
+		"create": {Bin: bin, Dir: dir, Prompt: prompt, OutputSchemaPath: schemaPath},
+		"resume": {Bin: bin, Dir: dir, ThreadID: "thread-1", Prompt: prompt, OutputSchemaPath: schemaPath},
 	} {
 		t.Run(name, func(t *testing.T) {
 			res, err := Run(context.Background(), o)
@@ -62,6 +74,20 @@ console.log(JSON.stringify({type:"turn.completed"}));
 			}
 			if reflect.DeepEqual(argv, []string{}) {
 				t.Fatal("shim recorded no argv")
+			}
+			schemaIndex := -1
+			for i, arg := range argv {
+				if arg == "--output-schema" {
+					schemaIndex = i
+					break
+				}
+			}
+			if schemaIndex < 0 || schemaIndex+1 == len(argv) || argv[schemaIndex+1] != schemaPath {
+				t.Fatalf("shim argv=%v, want the complete output schema path %q", argv, schemaPath)
+			}
+			readback, err := os.ReadFile(filepath.Join(dir, "schema-readback.json"))
+			if err != nil || string(readback) != schema {
+				t.Fatalf("schema read through .cmd shim=%q err=%v, want the original schema", readback, err)
 			}
 		})
 	}
