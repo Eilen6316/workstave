@@ -6,41 +6,49 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+type InjectionResult string
+
+const (
+	InjectionDetected             InjectionResult = "detected"
+	InjectionNotDetected          InjectionResult = "not_detected"
+	InjectionInsufficientEvidence InjectionResult = "insufficient_evidence"
 )
 
 // PromptReport describes the system prompt layers observed in one diagnostic invocation.
-// It separates what the CLI assembles locally from what actually leaves the machine, so
-// a gateway that modifies the request is detectable without relying on model cooperation.
+// It compares the local prompt snapshot with the request shape the CLI itself recorded. It has
+// no gateway-side or model-side receipt, so it cannot prove what a gateway forwarded.
 type PromptReport struct {
-	// CLIPrefix is the identity string the CLI binary hard-codes before the user system prompt.
-	// This is the vendor (Anthropic) injection, present in every invocation regardless of config.
+	// CLIPrefix is the first system segment in the CLI-local api-request-shape record.
 	CLIPrefix string
 	// LocalSegments is the full system prompt array the CLI assembled before sending, taken from
-	// the prompt_snapshot attachment. Includes CLIPrefix, user config, and any AppendSystemPrompt.
+	// the first prompt_snapshot attachment. It does not include CLIPrefix; it holds the user
+	// configuration and any AppendSystemPrompt.
 	LocalSegments []string
-	// WireSegments is the system prompt array recorded in the api-request-shape, which is what
-	// the CLI signed and sent over the network. If a gateway modifies the request, WireSegments
-	// will differ from LocalSegments.
+	// WireSegments is the system prompt array in the CLI-local api-request-shape record. This
+	// records the request shape observed by the CLI, not a gateway-side or model-side receipt.
 	WireSegments []string
-	// RequestDigest is the CLI's own hash of the outbound request. Use it as a stable baseline:
-	// the same prompt+config always produces the same digest; a gateway that alters the payload
-	// will change the digest the next time the model returns a different response pattern.
+	// RequestDigest is the CLI-recorded digest for the api-request matching the selected shapeHash.
+	// It does not prove that a gateway forwarded the same bytes to a model.
 	RequestDigest string
 	// ServedByAnthropic is false when the CLI detected a non-Anthropic endpoint (ANTHROPIC_BASE_URL
 	// points elsewhere). It does not by itself mean injection occurred.
 	ServedByAnthropic bool
-	// GatewayURL is the value of ANTHROPIC_BASE_URL at call time, or empty for the default endpoint.
+	// GatewayURL contains only the scheme and host from ANTHROPIC_BASE_URL.
 	GatewayURL string
-	// InjectionDetected is true when WireSegments and LocalSegments differ in content, indicating
-	// the gateway modified the system prompt before forwarding it to the model.
-	InjectionDetected bool
+	// InjectionDetected compares the local snapshot with its CLI-recorded request shape.
+	InjectionDetected InjectionResult
 }
 
 // Inspect runs one minimal diagnostic invocation and reads the session JSONL it writes to disk.
-// It returns a PromptReport that separates the CLI's own injections from any gateway-added content.
+// It returns a PromptReport comparing the local snapshot with the CLI-recorded request shape.
+// The result is a weak local signal, not proof about what a gateway forwarded.
 // The invocation uses the caller-supplied Dir and a fresh session ID; it never resumes.
 // The diagnostic prompt is a no-op request that costs roughly one input token.
 func Inspect(ctx context.Context, dir string, maxBudget string) (PromptReport, error) {
@@ -68,14 +76,7 @@ func Inspect(ctx context.Context, dir string, maxBudget string) (PromptReport, e
 	// Read the session file even when Run returned an error — a non-zero exit still writes the
 	// JSONL and may contain the snapshot we need.
 	report, parseErr := parseSessionReport(dir, sessionID)
-	report.GatewayURL = os.Getenv("ANTHROPIC_BASE_URL")
-
-	// CLIPrefix is the first wire segment when it is the standard Anthropic identity string.
-	// The CLI always prepends it as a separate system block before the user config segments.
-	if report.CLIPrefix == "" && len(report.WireSegments) > 0 && strings.HasPrefix(report.WireSegments[0], "You are Claude Code") {
-		report.CLIPrefix = report.WireSegments[0]
-	}
-
+	report.GatewayURL = safeGatewayURL(os.Getenv("ANTHROPIC_BASE_URL"))
 	report.InjectionDetected = injectionDetected(report.CLIPrefix, report.LocalSegments, report.WireSegments)
 
 	if parseErr != nil {
@@ -117,7 +118,16 @@ func encodeDirForClaude(dir string) string {
 	return r.Replace(dir)
 }
 
-// parseSessionReport reads the session JSONL and extracts the three prompt layers.
+func safeGatewayURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host}).String()
+}
+
+// parseSessionReport reads the first prompt snapshot, the first later CLI request shape, and the
+// request digest correlated with that shape by shapeHash.
 func parseSessionReport(dir, sessionID string) (PromptReport, error) {
 	path, err := sessionPath(dir, sessionID)
 	if err != nil {
@@ -130,6 +140,10 @@ func parseSessionReport(dir, sessionID string) (PromptReport, error) {
 	defer f.Close()
 
 	var report PromptReport
+	var snapshotTime time.Time
+	var selectedShapeHash string
+	snapshotSeen := false
+	shapeSelected := false
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -142,27 +156,22 @@ func parseSessionReport(dir, sessionID string) (PromptReport, error) {
 			var att struct {
 				Attachment struct {
 					Type         string   `json:"type"`
-					CLIPrefix    string   `json:"cliPrefix"`
 					SystemPrompt []string `json:"systemPrompt"`
 				} `json:"attachment"`
 			}
 			if err := json.Unmarshal(sc.Bytes(), &att); err != nil {
 				continue
 			}
-			if att.Attachment.Type == "prompt_snapshot" {
-				if att.Attachment.CLIPrefix != "" && report.CLIPrefix == "" {
-					report.CLIPrefix = att.Attachment.CLIPrefix
-				}
-				// Use only the first snapshot — it matches the api-request-shape timestamp.
-				// Later snapshots reflect mid-session system turns and will differ in segment
-				// count from what was actually sent over the wire, causing false positives.
-				if len(att.Attachment.SystemPrompt) > 0 && len(report.LocalSegments) == 0 {
-					report.LocalSegments = att.Attachment.SystemPrompt
-				}
+			if att.Attachment.Type == "prompt_snapshot" && !snapshotSeen {
+				snapshotSeen = true
+				report.LocalSegments = att.Attachment.SystemPrompt
+				snapshotTime, _ = time.Parse(time.RFC3339Nano, stringValue(raw["timestamp"]))
 			}
 		case `"api-request-shape"`:
 			var shape struct {
-				Shape struct {
+				ShapeHash string `json:"shapeHash"`
+				Timestamp string `json:"timestamp"`
+				Shape     struct {
 					System []struct {
 						Type string `json:"type"`
 						Text string `json:"text"`
@@ -172,47 +181,71 @@ func parseSessionReport(dir, sessionID string) (PromptReport, error) {
 			if err := json.Unmarshal(sc.Bytes(), &shape); err != nil {
 				continue
 			}
+			if !snapshotSeen || shapeSelected || shape.ShapeHash == "" || snapshotTime.IsZero() {
+				continue
+			}
+			shapeTime, err := time.Parse(time.RFC3339Nano, shape.Timestamp)
+			if err != nil || shapeTime.Before(snapshotTime) {
+				continue
+			}
+			shapeSelected = true
+			selectedShapeHash = shape.ShapeHash
 			for _, seg := range shape.Shape.System {
 				if seg.Text != "" {
 					report.WireSegments = append(report.WireSegments, seg.Text)
 				}
 			}
+			if len(report.WireSegments) != 0 {
+				report.CLIPrefix = report.WireSegments[0]
+			}
 		case `"api-request"`:
 			var req struct {
+				ShapeHash     string `json:"shapeHash"`
 				RequestDigest string `json:"requestDigest"`
 			}
 			if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
 				continue
 			}
-			if req.RequestDigest != "" {
+			if shapeSelected && req.ShapeHash == selectedShapeHash && req.RequestDigest != "" {
 				report.RequestDigest = req.RequestDigest
 			}
 		case `"system"`:
 			// system/init carries served_by_anthropic.
 			var init struct {
 				Subtype           string `json:"subtype"`
-				ServedByAnthropic bool   `json:"served_by_anthropic"`
+				ServedByAnthropic *bool  `json:"served_by_anthropic"`
 			}
 			if err := json.Unmarshal(sc.Bytes(), &init); err != nil {
 				continue
 			}
-			if init.Subtype == "init" {
-				report.ServedByAnthropic = init.ServedByAnthropic
+			if init.Subtype == "init" && init.ServedByAnthropic != nil {
+				report.ServedByAnthropic = *init.ServedByAnthropic
 			}
 		}
 	}
 	return report, sc.Err()
 }
 
-// injectionDetected compares the non-whitespace content of local and wire segments.
+func stringValue(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
+// injectionDetected compares the non-whitespace content of local and CLI-recorded request segments.
 // The CLI splits the system prompt into multiple segments locally but merges them into fewer
 // blocks over the wire (cliPrefix as block 0, everything else as block 1). The wire version
 // also adds \n\n between logical sections that the local snapshot omits. We strip all
 // whitespace before comparing so structural and spacing differences don't trigger false positives.
 // The diagnostic " " AppendSystemPrompt segment is excluded before comparison.
-func injectionDetected(cliPrefix string, local, wire []string) bool {
+func injectionDetected(cliPrefix string, local, wire []string) InjectionResult {
+	// The first request segment must be the known Claude Code identity prefix. Otherwise the
+	// comparison would use an unverified segment as its own baseline, so evidence is insufficient.
+	if !strings.HasPrefix(cliPrefix, "You are Claude Code") || len(local) == 0 || len(wire) == 0 {
+		return InjectionInsufficientEvidence
+	}
 	// Filter out the diagnostic single-space segment added by --append-system-prompt.
-	filtered := local[:0:0]
+	filtered := make([]string, 0, len(local))
 	for _, s := range local {
 		if strings.TrimSpace(s) != "" {
 			filtered = append(filtered, s)
@@ -222,7 +255,10 @@ func injectionDetected(cliPrefix string, local, wire []string) bool {
 	expected := stripWS(cliPrefix + strings.Join(filtered, ""))
 	// Actual: all wire segments concatenated (cliPrefix is already wire[0]), all whitespace removed.
 	actual := stripWS(strings.Join(wire, ""))
-	return expected != actual
+	if expected != actual {
+		return InjectionDetected
+	}
+	return InjectionNotDetected
 }
 
 // stripWS removes every whitespace character from s.

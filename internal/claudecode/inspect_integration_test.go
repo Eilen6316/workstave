@@ -25,14 +25,8 @@ func TestRealInspect(t *testing.T) {
 	t.Logf("InjectionDetected:  %v", report.InjectionDetected)
 	t.Logf("RequestDigest:      %s", report.RequestDigest)
 	t.Logf("CLIPrefix:          %q", report.CLIPrefix)
-	t.Logf("LocalSegments (%d):", len(report.LocalSegments))
-	for i, s := range report.LocalSegments {
-		t.Logf("  [%d] %q", i, truncate(s, 120))
-	}
-	t.Logf("WireSegments (%d):", len(report.WireSegments))
-	for i, s := range report.WireSegments {
-		t.Logf("  [%d] %q", i, truncate(s, 120))
-	}
+	t.Logf("LocalSegments count: %d", len(report.LocalSegments))
+	t.Logf("WireSegments count:  %d", len(report.WireSegments))
 
 	if report.CLIPrefix == "" {
 		t.Error("CLIPrefix is empty — prompt_snapshot cliPrefix not found in session JSONL")
@@ -49,23 +43,11 @@ func TestRealInspect(t *testing.T) {
 	if report.RequestDigest == "" {
 		t.Error("RequestDigest is empty")
 	}
-	if report.InjectionDetected {
-		t.Logf("INJECTION DETECTED: wire segments differ from local snapshot")
-		t.Logf("Local count=%d  Wire count=%d", len(report.LocalSegments), len(report.WireSegments))
-		for i := range report.WireSegments {
-			if i < len(report.LocalSegments) && strings.TrimSpace(report.LocalSegments[i]) != strings.TrimSpace(report.WireSegments[i]) {
-				t.Logf("  segment[%d] differs", i)
-				t.Logf("    local: %q", truncate(report.LocalSegments[i], 200))
-				t.Logf("    wire:  %q", truncate(report.WireSegments[i], 200))
-			}
-		}
+	if report.InjectionDetected == InjectionInsufficientEvidence {
+		t.Error("insufficient evidence to compare local prompt and CLI-recorded request shape")
+	}
+	if report.InjectionDetected == InjectionDetected {
+		t.Logf("CLI-recorded request shape differs from the local prompt snapshot")
 		// Not a hard failure — this is a diagnostic, not an enforcement. The caller decides.
 	}
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }
