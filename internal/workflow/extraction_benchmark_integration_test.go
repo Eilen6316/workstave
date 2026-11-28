@@ -13,6 +13,7 @@ import (
 
 	"workstave/internal/outcome"
 	"workstave/internal/runner"
+	"workstave/internal/store"
 )
 
 type labeledMessage struct {
@@ -111,12 +112,12 @@ func TestRealExtractionMatrix(t *testing.T) {
 				t.Fatal("the full prompt must be longer than the short prompt")
 			}
 
-			full := runExtractionCall(t, harnessName, fullPrompt, extractionSchema)
-			short := runExtractionCall(t, harnessName, shortEnvelopePrompt, extractionSchema)
-			transcript := runExtractionCall(t, harnessName, shortTranscriptPrompt, extractionSchema)
+			full := runExtractionCall(t, harnessName, fullPrompt, extractionSchema, "")
+			short := runExtractionCall(t, harnessName, shortEnvelopePrompt, extractionSchema, "")
+			transcript := runExtractionCall(t, harnessName, shortTranscriptPrompt, extractionSchema, "")
 
 			extractPrompt := extractionInstructions + "\nMessages:\n" + envelopedInput
-			extracted := runExtractionCall(t, harnessName, extractPrompt, extractionOnlySchema)
+			extracted := runExtractionCall(t, harnessName, extractPrompt, extractionOnlySchema, "")
 			twoCallAnswers := benchmarkRun{}
 			var extractedEnvelope extractionEnvelope
 			if extracted.Error == nil {
@@ -128,7 +129,7 @@ func TestRealExtractionMatrix(t *testing.T) {
 						extracted.Error = fmt.Errorf("encode extracted facts: %w", err)
 					} else {
 						answerPrompt := "Answer the two questions using only these extracted confirmed facts. Do not infer missing facts.\nConfirmed facts:\n" + string(facts) + "\n" + questions
-						twoCallAnswers = runExtractionCall(t, harnessName, answerPrompt, answerOnlySchema)
+						twoCallAnswers = runExtractionCall(t, harnessName, answerPrompt, answerOnlySchema, "")
 					}
 				}
 			} else {
@@ -142,6 +143,34 @@ func TestRealExtractionMatrix(t *testing.T) {
 				t.Logf("harness=%s condition=%s prompt_chars=%d result=%s", harnessName, result.name, result.run.PromptChars, summarizeFullResponse(result.run))
 			}
 			t.Logf("harness=%s condition=two-call-extract-and-answer total_prompt_chars=%d extraction_prompt_chars=%d reply_prompt_chars=%d extraction=%s answers=%s", harnessName, extracted.PromptChars+twoCallAnswers.PromptChars, extracted.PromptChars, twoCallAnswers.PromptChars, summarizeExtraction(extracted), summarizeAnswers(twoCallAnswers))
+			if harnessName == "claude-code" {
+				// Production-aligned arm: uses the real mainAppendPrompt and compilePrompt, matching
+				// Claude Main's prompt-driven JSON output without an output schema flag.
+				mainSnap := inputSnapshot{
+					Context:        store.MainContext{WorkID: "bench-work", Revision: 0},
+					ConversationID: "bench-conv",
+					CurrentInput:   "认证服务必须使用 JWT，导出格式为 CSV。",
+				}
+				prodPrompt := compilePrompt(mainSnap)
+				prod := runExtractionCall(t, harnessName, prodPrompt, "", mainAppendPrompt)
+				var prodCompletion store.MainCompletion
+				var prodDecodeErr error
+				if prod.Error == nil {
+					prodCompletion, prodDecodeErr = decodeMainReply(prod.Text)
+				}
+				confirmedJWT := false
+				for _, ch := range prodCompletion.Changes {
+					if ch.Status == "confirmed" && strings.Contains(strings.ToLower(ch.Value), "jwt") {
+						confirmedJWT = true
+					}
+				}
+				t.Logf("harness=%s condition=production-main-prompt-with-append json_valid=%t confirmed_jwt=%t identity_response=%t",
+					harnessName,
+					prod.Error == nil && prodDecodeErr == nil,
+					confirmedJWT,
+					prod.Error == nil && (strings.Contains(strings.ToLower(prod.Text), "i am claude code") || strings.Contains(strings.ToLower(prod.Text), "you are")),
+				)
+			}
 		})
 	}
 }
@@ -162,7 +191,7 @@ func renderSample(messages []labeledMessage, enveloped bool) string {
 	return b.String()
 }
 
-func runExtractionCall(t *testing.T, harnessName, prompt, schema string) benchmarkRun {
+func runExtractionCall(t *testing.T, harnessName, prompt, schema, appendSystemPrompt string) benchmarkRun {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -170,8 +199,8 @@ func runExtractionCall(t *testing.T, harnessName, prompt, schema string) benchma
 	result := benchmarkRun{PromptChars: utf8.RuneCountInString(prompt)}
 	switch harnessName {
 	case "claude-code":
-		h := runner.Claude{MaxBudget: "0.05", Model: "claude-haiku-4-5-20251001"}
-		execution, err := h.Execute(ctx, runner.Request{Dir: dir, NativeID: h.NewNativeID(), Prompt: prompt, OutputSchema: schema}, func(string) {})
+		h := runner.Claude{MaxBudget: "0.10", Model: "claude-haiku-4-5-20251001"}
+		execution, err := h.Execute(ctx, runner.Request{Dir: dir, NativeID: h.NewNativeID(), Prompt: prompt, OutputSchema: schema, AppendSystemPrompt: appendSystemPrompt}, func(string) {})
 		if err != nil {
 			result.Error = err
 		} else if execution.Outcome != outcome.Completed {
